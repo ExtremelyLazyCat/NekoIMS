@@ -1,0 +1,12 @@
+{
+  "domain": "ims.mnc<MNC>.mcc<MCC>.pub.3gppnetwork.org",
+  "msisdn": "+15551234567",
+  "pcscf": "2001:db8::1",
+  "pcscf_port": 5060,
+  "transport": "udp",
+  "simcard_server": "unix:/run/nekoims/simcard.sock",
+  "imei": "000000000000000",
+  "p_access_network_info": "IEEE-802.11;country=US;i-wlan-node-id=ffffffffffff",
+  "expires": 600000,
+  "sip_trace": false
+}
