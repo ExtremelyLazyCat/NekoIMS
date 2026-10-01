@@ -1,0 +1,24 @@
+{
+  "name": "Verizon Wireless",
+  "mccmnc": "311480",
+  "domain": "vzims.com",
+  "epdg": "wo.vzwwo.com",
+  "apn": "ims",
+  "transport": "tcp",
+  "p_access_network_info": "IEEE-802.11;country=US;i-wlan-node-id=ffffffffffff",
+  "contact_features": [
+    "+g.3gpp.icsi-ref=\"urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel\"",
+    "+sip.instance=\"<{imei_urn}>\"",
+    "audio"
+  ],
+  "expires": 600000,
+  "notes": [
+    "Private home domain vzims.com and ePDG wo.vzwwo.com, not the 3GPP discovery names. The P-CSCF comes from the ePDG tunnel (SWu-IKEv2 prints it).",
+    "REGISTER uses IMS-AKA with algorithm=AKAv2-MD5, no sec-agree/IPsec on Gm. The network grants 7200 s whatever Expires asks for.",
+    "+sip.instance must carry the IMEI of the device the SIM is actually in (here the modem); reusing another handset's IMEI breaks calls.",
+    "Outgoing calls: the reliable 183 carries the SDP answer, then a 180 and 200 OK without SDP (handled by the early media workaround in main.cpp).",
+    "BYEs must carry Reason \"User Triggered\", P-Access-Network-Info and P-Preferred-Identity, or Google Pixels and LTE-attached SIMs get stuck (src/bye_reason.cpp).",
+    "SMS arrives as SIP MESSAGE with application/vnd.3gpp2.sms, which NekoIMS doesn't handle yet, so +g.3gpp.smsip is not advertised.",
+    "TCP works over both Wi-Fi and LTE backhaul; incoming calls from the network arrive over TCP regardless."
+  ]
+}
