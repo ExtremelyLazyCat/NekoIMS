@@ -20,6 +20,7 @@
 #include <re.h>
 #include <baresip.h>
 
+#include "bye_reason.h"
 #include "ims_register.h"
 #include "simcard_client.h"
 
@@ -240,7 +241,7 @@ void early_media_fix_handler(enum bevent_ev ev, struct bevent* event,
     if (!sdp_media_rformat(stream_sdpmedia(audio_strm(au)), NULL)) return;
 
     info("nekoims: restarting audio stopped by SDP-less %s\n",
-         ev == BEVENT_CALL_RINGING ? "180" : "200");
+         ev == BEVENT_CALL_RINGING ? "18x" : "200");
 
     int err = call_update_media(call);
     if (err) warning("nekoims: audio restart failed: %m\n", err);
@@ -428,6 +429,15 @@ int main(int argc, char* argv[]) {
             pl_set_str(&val, hdrs[i].second.c_str());
             ua_add_custom_hdr(ua, &name, &val);
         }
+
+        // Handsets repeat these on BYE (TS 24.229 5.1.5)
+        std::string bye_hdrs;
+        for (size_t i = 0; i < hdrs.size(); ++i) {
+            if (hdrs[i].first == "P-Preferred-Identity" ||
+                hdrs[i].first == "P-Access-Network-Info")
+                bye_hdrs += hdrs[i].first + ": " + hdrs[i].second + "\r\n";
+        }
+        nekoims::set_bye_headers(bye_hdrs);
     }
 
     reg.reset(new nekoims::ImsRegistration(uag_sip(), rc, sim));

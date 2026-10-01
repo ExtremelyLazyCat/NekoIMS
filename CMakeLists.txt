@@ -317,6 +317,7 @@ add_executable(nekoims
   src/main.cpp
   src/ims_register.cpp
   src/simcard_client.cpp
+  src/bye_reason.cpp
 )
 
 target_compile_definitions(nekoims PRIVATE
@@ -329,6 +330,9 @@ target_link_libraries(nekoims PRIVATE
   CURL::libcurl
   nlohmann_json::nlohmann_json
 )
+
+# Add the IMS release reason to our BYEs (see src/bye_reason.cpp).
+target_link_options(nekoims PRIVATE -Wl,--wrap=sipsess_bye)
 
 if(NEKOIMS_WITH_PCSC)
   target_compile_definitions(nekoims PRIVATE NEKOIMS_WITH_PCSC)

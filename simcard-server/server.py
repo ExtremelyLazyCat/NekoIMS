@@ -12,8 +12,9 @@ API (compatible with https://github.com/fasferraz/USIM-https-server, plain HTTP)
 
   GET /?type=rand-autn&rand=<32 hex>&autn=<32 hex>
       -> {"res": "<hex>", "ck": "<hex>", "ik": "<hex>"}
-      On AKA synchronisation failure (extension, fields absent upstream):
-      -> {"res": null, "ck": null, "ik": null, "auts": "<28 hex>"}
+      On AKA synchronisation failure (AUTS in "res", as SWu-IKEv2 expects;
+      "auts" is an extension):
+      -> {"res": "<auts>", "ck": null, "ik": null, "auts": "<28 hex>"}
 
   GET /?type=apdu&hex=<apdu hex>
       Raw APDU passthrough on the currently selected application.
@@ -151,8 +152,9 @@ class Usim:
         tag, p = data[0], 1
         if tag == 0xDC:  # synchronisation failure
             n = data[p]
-            return {"res": None, "ck": None, "ik": None,
-                    "auts": data[p + 1:p + 1 + n].hex()}
+            auts = data[p + 1:p + 1 + n].hex()
+            # SWu-IKEv2 / USIM-https-server put AUTS in "res" with null CK/IK
+            return {"res": auts, "ck": None, "ik": None, "auts": auts}
         if tag != 0xDB:
             raise CardError(f"unexpected AUTHENTICATE response tag {tag:02X}")
 

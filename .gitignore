@@ -19,5 +19,6 @@ build/*
 #  option (not recommended) you can uncomment the following to ignore the entire idea folder.
 #cmake-build-*
 
+*/__pycache__/*
 build/
 nekoims.json
