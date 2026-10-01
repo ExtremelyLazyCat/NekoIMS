@@ -20,7 +20,6 @@
 #include <re.h>
 #include <baresip.h>
 
-#include "bye_reason.h"
 #include "ims_register.h"
 #include "simcard_client.h"
 
@@ -54,6 +53,7 @@ struct Settings {
 };
 
 nekoims::ImsRegistration* g_reg = nullptr;
+std::string g_bye_hdrs;  // see bye_headers_handler()
 
 void usage(const char* argv0) {
     std::fprintf(stderr,
@@ -248,6 +248,28 @@ void early_media_fix_handler(enum bevent_ev ev, struct bevent* event,
     if (err) warning("nekoims: audio restart failed: %m\n", err);
 }
 
+// Makes our BYEs look like a Verizon handset's (TS 24.229).
+//
+// Verizon handsets send Reason: SIP;cause=200;text="User Triggered" on
+// hangup. Without it, a Google Pixel we hang up on keeps a stale call slot in
+// its modem and rejects every later call from us until its IMS stack
+// restarts. They also send P-Access-Network-Info and P-Preferred-Identity,
+// which the network uses when releasing the session. It's still a mistrery
+// why this bug only affects Google Pixel phones, but we this also brings us
+// closer to the iPhone VoWiFi behavior, which is a good thing.
+//
+// Needs call_set_close_headers() from patches/baresip. libre also sends these
+// on our 200 OK when the peer hangs up.
+void bye_headers_handler(enum bevent_ev ev, struct bevent* event, void* arg) {
+    (void)arg;
+
+    if (ev != BEVENT_CALL_ANSWERED && ev != BEVENT_CALL_ESTABLISHED) return;
+
+    int err = call_set_close_headers(bevent_get_call(event), "%s",
+                                     g_bye_hdrs.c_str());
+    if (err) warning("nekoims: cannot set BYE headers: %m\n", err);
+}
+
 void reg_stopped(void* arg) {
     (void)arg;
     re_cancel();
@@ -409,6 +431,7 @@ int main(int argc, char* argv[]) {
     }
 
     err = bevent_register(early_media_fix_handler, NULL);
+    if (!err) err = bevent_register(bye_headers_handler, NULL);
     if (err) {
         warning("nekoims: event handler setup failed: %m\n", err);
         goto out;
@@ -443,13 +466,12 @@ int main(int argc, char* argv[]) {
         }
 
         // Handsets repeat these on BYE (TS 24.229 5.1.5)
-        std::string bye_hdrs;
+        g_bye_hdrs = "Reason: SIP;cause=200;text=\"User Triggered\"\r\n";
         for (size_t i = 0; i < hdrs.size(); ++i) {
             if (hdrs[i].first == "P-Preferred-Identity" ||
                 hdrs[i].first == "P-Access-Network-Info")
-                bye_hdrs += hdrs[i].first + ": " + hdrs[i].second + "\r\n";
+                g_bye_hdrs += hdrs[i].first + ": " + hdrs[i].second + "\r\n";
         }
-        nekoims::set_bye_headers(bye_hdrs);
     }
 
     reg.reset(new nekoims::ImsRegistration(uag_sip(), rc, sim));
@@ -467,6 +489,7 @@ out:
     g_reg = nullptr;
     reg.reset();
 
+    bevent_unregister(bye_headers_handler);
     bevent_unregister(early_media_fix_handler);
     ua_stop_all(true);
     ua_close();

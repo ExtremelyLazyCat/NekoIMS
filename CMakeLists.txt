@@ -253,9 +253,17 @@ set(RE_LIBRARY re CACHE STRING "" FORCE)
 set(re_DIR "${re_SOURCE_DIR}/cmake" CACHE PATH "" FORCE)
 list(APPEND CMAKE_MODULE_PATH "${re_SOURCE_DIR}/cmake")
 
+# Local patches on top of the pinned release (patches/baresip/*.patch).
+# GIT_DIR points nowhere so git apply ignores any enclosing repository.
+find_package(Git REQUIRED)
+file(GLOB BARESIP_PATCHES "${CMAKE_CURRENT_SOURCE_DIR}/patches/baresip/*.patch")
+list(SORT BARESIP_PATCHES)
+
 FetchContent_Declare(baresip
   URL https://github.com/baresip/baresip/archive/refs/tags/v${BARESIP_VERSION}.tar.gz
   URL_HASH SHA256=${BARESIP_SHA256}
+  PATCH_COMMAND ${CMAKE_COMMAND} -E env GIT_DIR=<SOURCE_DIR>/.nogit
+                ${GIT_EXECUTABLE} apply --verbose ${BARESIP_PATCHES}
   EXCLUDE_FROM_ALL
 )
 FetchContent_MakeAvailable(baresip)
@@ -317,7 +325,6 @@ add_executable(nekoims
   src/main.cpp
   src/ims_register.cpp
   src/simcard_client.cpp
-  src/bye_reason.cpp
 )
 
 target_compile_definitions(nekoims PRIVATE
@@ -330,9 +337,6 @@ target_link_libraries(nekoims PRIVATE
   CURL::libcurl
   nlohmann_json::nlohmann_json
 )
-
-# Add the IMS release reason to our BYEs (see src/bye_reason.cpp).
-target_link_options(nekoims PRIVATE -Wl,--wrap=sipsess_bye)
 
 if(NEKOIMS_WITH_PCSC)
   target_compile_definitions(nekoims PRIVATE NEKOIMS_WITH_PCSC)
