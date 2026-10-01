@@ -15,6 +15,11 @@ cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
 cmake --build build -j$(nproc)
 ```
 
+On Windows, run the same commands from a Visual Studio developer prompt
+(MSVC, x64 or ARM64). Git must be on `PATH`. Audio uses WASAPI (`audio_device`
+defaults to `default`) instead of ALSA, and AMR is compiled in tree since
+autotools isn't available.
+
 ### Config
 Copy nekoims.example.json to nekoims.json and edit
 * IMEI 

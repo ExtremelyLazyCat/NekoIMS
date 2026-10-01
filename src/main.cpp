@@ -30,6 +30,17 @@ const char* const kDefaultSimcardServer = "unix:/run/nekoims/simcard.sock";
 const char* const kMmtelIcsi = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";
 const int kAsyncWorkers = 4;
 
+// Must match NEKOIMS_PLATFORM_MODULES in CMakeLists.txt.
+#ifdef _WIN32
+const char* const kAudioModule = "wasapi";
+const char* const kConsoleModule = "wincons";
+const char* const kDefaultAudioDevice = "default";
+#else
+const char* const kAudioModule = "alsa";
+const char* const kConsoleModule = "stdio";
+const char* const kDefaultAudioDevice = "plughw:0,0";
+#endif
+
 struct Settings {
     std::string domain;  // IMS home network domain
     std::string msisdn;  // E.164, e.g. +15551234567 (optional)
@@ -45,7 +56,7 @@ struct Settings {
     std::string imei;  // for +sip.instance (TS 24.229 5.1.1.2.1)
     std::string user_agent = "NekoIMS/" NEKOIMS_VERSION;
     std::string pani;  // P-Access-Network-Info (optional)
-    std::string audio_device = "plughw:0,0";  // ALSA device
+    std::string audio_device = kDefaultAudioDevice;  // ALSA/WASAPI device
     std::vector<std::string> contact_features;
     uint32_t expires = 600000;
     bool debug = false;
@@ -181,21 +192,21 @@ std::string baresip_config(const Settings& s) {
     if (!s.ifname.empty()) c << "net_interface\t" << s.ifname << "\n";
     if (s.pcscf.find(':') != std::string::npos) c << "net_prefer_ipv6\tyes\n";
 
-    c << "audio_player\talsa," << s.audio_device << "\n"
-      << "audio_source\talsa," << s.audio_device << "\n"
-      << "audio_alert\talsa," << s.audio_device << "\n";
+    c << "audio_player\t" << kAudioModule << "," << s.audio_device << "\n"
+      << "audio_source\t" << kAudioModule << "," << s.audio_device << "\n"
+      << "audio_alert\t" << kAudioModule << "," << s.audio_device << "\n";
 
-    // stdio + menu: interactive keys (d = dial, a = answer, b = hangup)
+    // stdio/wincons + menu: interactive keys (d = dial, a = answer, b = hangup)
     // misleading names aside, these modules aren't *actually* loaded from disk,
     // they're statically linked in. The module.so declarations are still
     // necessary for baresip to use them, though.
-    c << "module\tstdio.so\n"
+    c << "module\t" << kConsoleModule << ".so\n"
       << "module\tmenu.so\n"
       << "module\tg711.so\n"
       << "module\tamr.so\n"
       << "module\tauconv.so\n"
       << "module\tauresamp.so\n"
-      << "module\talsa.so\n"
+      << "module\t" << kAudioModule << ".so\n"
       << "module\tausine.so\n"
       << "module\taufile.so\n";
 
@@ -331,8 +342,13 @@ int main(int argc, char* argv[]) {
     }
 
     // Keep logs live when piped (e.g. to tee); stdbuf can't reach a
-    // static binary.
+    // static binary. The MSVC CRT has no line buffering (_IOLBF means full
+    // buffering and rejects size 0), so go unbuffered there.
+#ifdef _WIN32
+    std::setvbuf(stdout, NULL, _IONBF, 0);
+#else
     std::setvbuf(stdout, NULL, _IOLBF, 0);
+#endif
 
     Settings settings;
     if (!load_settings(config_path, settings)) return EXIT_FAILURE;

@@ -14,6 +14,12 @@ endif()
 option(NEKOIMS_FULLY_STATIC "Link libc and libstdc++ statically too (-static)" ON)
 option(NEKOIMS_WITH_PCSC "Build pcsc-lite client library for simcard-server" OFF)
 
+# MSVC has no -static; the equivalent is the static CRT (/MT), which has to
+# be chosen before any dependency target is created.
+if(MSVC AND NEKOIMS_FULLY_STATIC)
+  set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 include(FetchContent)
 include(ExternalProject)
 
@@ -124,8 +130,39 @@ FetchContent_MakeAvailable(json)
 
 ##############################################################################
 #
-# opencore-amr + vo-amrwbenc (autotools, built out of tree)
+# opencore-amr + vo-amrwbenc
 #
+# Autotools out of tree everywhere but Windows, where there's no shell to run
+# configure; there they're compiled in tree from the same pinned tarballs.
+#
+
+if(WIN32)
+
+FetchContent_Declare(opencore_amr
+  URL https://downloads.sourceforge.net/project/opencore-amr/opencore-amr/opencore-amr-${OPENCORE_AMR_VERSION}.tar.gz
+  URL_HASH SHA256=${OPENCORE_AMR_SHA256}
+  SOURCE_SUBDIR no-cmake  # download only
+)
+FetchContent_Declare(vo_amrwbenc
+  URL https://downloads.sourceforge.net/project/opencore-amr/vo-amrwbenc/vo-amrwbenc-${VO_AMRWBENC_VERSION}.tar.gz
+  URL_HASH SHA256=${VO_AMRWBENC_SHA256}
+  SOURCE_SUBDIR no-cmake
+)
+FetchContent_MakeAvailable(opencore_amr vo_amrwbenc)
+
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/AmrSources.cmake)
+set(AMR_INCLUDE "${CMAKE_BINARY_DIR}/_deps/amr-include")
+amr_add_libraries(${opencore_amr_SOURCE_DIR} ${vo_amrwbenc_SOURCE_DIR} ${AMR_INCLUDE})
+
+# Pre-seed baresip's FindAMR; library values are the targets above.
+set(NB_INCLUDE_DIR     "${AMR_INCLUDE}" CACHE PATH "" FORCE)
+set(WB_ENC_INCLUDE_DIR "${AMR_INCLUDE}" CACHE PATH "" FORCE)
+set(WB_DEC_INCLUDE_DIR "${AMR_INCLUDE}" CACHE PATH "" FORCE)
+set(NB_LIBRARY        opencore-amrnb CACHE STRING "" FORCE)
+set(WB_LIBRARY        opencore-amrwb CACHE STRING "" FORCE)
+set(WB_VO_ENC_LIBRARY vo-amrwbenc    CACHE STRING "" FORCE)
+
+else()
 
 set(AMR_PREFIX "${CMAKE_BINARY_DIR}/_deps/amr-install")
 set(AMR_CONFIGURE_ARGS
@@ -168,14 +205,18 @@ set(NB_LIBRARY        "${AMR_PREFIX}/lib/libopencore-amrnb.a" CACHE FILEPATH "" 
 set(WB_LIBRARY        "${AMR_PREFIX}/lib/libopencore-amrwb.a" CACHE FILEPATH "" FORCE)
 set(WB_VO_ENC_LIBRARY "${AMR_PREFIX}/lib/libvo-amrwbenc.a"    CACHE FILEPATH "" FORCE)
 
+endif()
+
 ##############################################################################
 #
-# alsa-lib (autotools, built out of tree)
+# alsa-lib (autotools, built out of tree; not used on Windows, see wasapi)
 #
 # Config files are read from the host at runtime. Plugins that live in shared
 # objects (pipewire, pulse) can't be loaded by a static binary, so use a
 # hardware device such as plughw:0,0.
 #
+
+if(NOT WIN32)
 
 set(ALSA_PREFIX "${CMAKE_BINARY_DIR}/_deps/alsa-install")
 
@@ -206,6 +247,8 @@ file(MAKE_DIRECTORY ${ALSA_PREFIX}/include)
 set(ALSA_INCLUDE_DIR "${ALSA_PREFIX}/include" CACHE PATH "" FORCE)
 set(ALSA_LIBRARY "${ALSA_PREFIX}/lib/libasound.a" CACHE FILEPATH "" FORCE)
 
+endif()
+
 ##############################################################################
 #
 # libre
@@ -234,8 +277,14 @@ target_link_libraries(re PRIVATE $<BUILD_INTERFACE:mbedcrypto>)
 #
 
 set(STATIC ON CACHE BOOL "" FORCE)
+# Audio driver and console UI are per platform; main.cpp picks the same ones.
+if(WIN32)
+  set(NEKOIMS_PLATFORM_MODULES wasapi wincons)
+else()
+  set(NEKOIMS_PLATFORM_MODULES alsa stdio)
+endif()
 set(MODULES
-  alsa
+  ${NEKOIMS_PLATFORM_MODULES}
   amr
   auconv
   aufile
@@ -243,7 +292,6 @@ set(MODULES
   ausine
   g711
   menu
-  stdio
   CACHE STRING "baresip modules linked into NekoIMS" FORCE
 )
 
@@ -268,8 +316,10 @@ FetchContent_Declare(baresip
 )
 FetchContent_MakeAvailable(baresip)
 
-add_dependencies(amr opencore_amr_ext vo_amrwbenc_ext)
-add_dependencies(alsa alsa_lib_ext)
+if(NOT WIN32)
+  add_dependencies(amr opencore_amr_ext vo_amrwbenc_ext)
+  add_dependencies(alsa alsa_lib_ext)
+endif()
 
 ##############################################################################
 #
@@ -343,7 +393,9 @@ if(NEKOIMS_WITH_PCSC)
   target_link_libraries(nekoims PRIVATE pcsclite)
 endif()
 
-if(NEKOIMS_FULLY_STATIC)
+if(MSVC)
+  # Static CRT is selected by CMAKE_MSVC_RUNTIME_LIBRARY above.
+elseif(NEKOIMS_FULLY_STATIC)
   target_link_options(nekoims PRIVATE -static)
 else()
   target_link_options(nekoims PRIVATE -static-libgcc -static-libstdc++)
