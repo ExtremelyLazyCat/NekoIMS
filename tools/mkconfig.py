@@ -12,8 +12,8 @@ bundle the 3GPP discovery names (TS 23.003) are used. The P-CSCF changes with
 every ePDG session, so it is normally passed to nekoims with -p; --pcscf here
 stores one in the file instead.
 
-    python3 tools/mkconfig.py -o nekoims.json [--force]
-    sudo ip netns exec ims ./build/nekoims -c nekoims.json -p <pcscf>
+    sudo python3 tools/mkconfig.py -o /etc/nekoims/config.json [--force]
+    sudo ip netns exec ims ./build/nekoims -p <pcscf>
 
 Needs no root: ModemManager exposes these properties to any user.
 """
@@ -182,6 +182,8 @@ def main():
 
     text = json.dumps(cfg, indent=2) + "\n"
     if args.output:
+        os.makedirs(os.path.dirname(os.path.abspath(args.output)),
+                    exist_ok=True)
         with open(args.output, "w") as f:
             f.write(text)
         log(f"wrote {args.output}")

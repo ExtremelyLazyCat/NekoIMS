@@ -26,7 +26,7 @@
 
 namespace {
 
-const char* const kDefaultConfigPath = "nekoims.json";
+const char* const kDefaultConfigPath = "/etc/nekoims/config.json";
 const char* const kDefaultSimcardServer = "unix:/run/nekoims/simcard.sock";
 const char* const kMmtelIcsi = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";
 const int kAsyncWorkers = 4;
