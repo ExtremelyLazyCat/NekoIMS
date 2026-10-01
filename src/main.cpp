@@ -4,7 +4,7 @@
 // G.711 codecs statically linked in), then registers to the IMS core through
 // the P-CSCF handed to us by the ePDG dialer. REGISTER and its IMS-AKA
 // challenge are handled by ImsRegistration; baresip handles calls.
-
+#include "platform.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -29,17 +29,6 @@ const char* const kDefaultConfigPath = "/etc/nekoims/config.json";
 const char* const kDefaultSimcardServer = "unix:/run/nekoims/simcard.sock";
 const char* const kMmtelIcsi = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";
 const int kAsyncWorkers = 4;
-
-// Must match NEKOIMS_PLATFORM_MODULES in CMakeLists.txt.
-#ifdef _WIN32
-const char* const kAudioModule = "wasapi";
-const char* const kConsoleModule = "wincons";
-const char* const kDefaultAudioDevice = "default";
-#else
-const char* const kAudioModule = "alsa";
-const char* const kConsoleModule = "stdio";
-const char* const kDefaultAudioDevice = "plughw:0,0";
-#endif
 
 struct Settings {
     std::string domain;  // IMS home network domain
@@ -344,11 +333,11 @@ int main(int argc, char* argv[]) {
     // Keep logs live when piped (e.g. to tee); stdbuf can't reach a
     // static binary. The MSVC CRT has no line buffering (_IOLBF means full
     // buffering and rejects size 0), so go unbuffered there.
-#ifdef _WIN32
-    std::setvbuf(stdout, NULL, _IONBF, 0);
-#else
-    std::setvbuf(stdout, NULL, _IOLBF, 0);
-#endif
+    if (kPlatform == Platform::Linux) {
+        std::setvbuf(stdout, NULL, _IOLBF, 0);
+    } else if (kPlatform == Platform::Windows) {
+        std::setvbuf(stdout, NULL, _IONBF, 0);
+    }
 
     Settings settings;
     if (!load_settings(config_path, settings)) return EXIT_FAILURE;
