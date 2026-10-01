@@ -58,8 +58,9 @@ nekoims::ImsRegistration* g_reg = nullptr;
 void usage(const char* argv0) {
     std::fprintf(stderr,
                  "NekoIMS %s\n"
-                 "Usage: %s [-c config.json] [-v] [-t] [-h]\n"
+                 "Usage: %s [-c config.json] [-p pcscf] [-v] [-t] [-h]\n"
                  "  -c <path>  Config file (default: %s)\n"
+                 "  -p <addr>  P-CSCF from the ePDG dialer (overrides config)\n"
                  "  -v         Verbose/debug logging\n"
                  "  -t         SIP trace\n"
                  "  -h         Show this help\n",
@@ -78,7 +79,7 @@ bool load_settings(const std::string& path, Settings& out) {
         nlohmann::json j = nlohmann::json::parse(in);
 
         out.domain = j.at("domain").get<std::string>();
-        out.pcscf = j.at("pcscf").get<std::string>();
+        out.pcscf = j.value("pcscf", out.pcscf);
         out.msisdn = j.value("msisdn", out.msisdn);
         out.impi = j.value("impi", out.impi);
         out.impu = j.value("impu", out.impu);
@@ -287,10 +288,13 @@ int main(int argc, char* argv[]) {
     std::string config_path = kDefaultConfigPath;
     bool verbose = false;
     bool trace = false;
+    std::string pcscf;
 
     for (int i = 1; i < argc; ++i) {
         if (!std::strcmp(argv[i], "-c") && i + 1 < argc) {
             config_path = argv[++i];
+        } else if (!std::strcmp(argv[i], "-p") && i + 1 < argc) {
+            pcscf = argv[++i];
         } else if (!std::strcmp(argv[i], "-v")) {
             verbose = true;
         } else if (!std::strcmp(argv[i], "-t")) {
@@ -310,6 +314,14 @@ int main(int argc, char* argv[]) {
 
     Settings settings;
     if (!load_settings(config_path, settings)) return EXIT_FAILURE;
+    if (!pcscf.empty()) settings.pcscf = pcscf;
+    if (settings.pcscf.empty()) {
+        std::fprintf(stderr,
+                     "nekoims: no P-CSCF, pass -p <addr> or set \"pcscf\" in "
+                     "%s\n",
+                     config_path.c_str());
+        return EXIT_FAILURE;
+    }
 
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK) {
         std::fprintf(stderr, "nekoims: curl_global_init failed\n");

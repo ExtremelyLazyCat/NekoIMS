@@ -8,11 +8,12 @@ mkconfig: generate nekoims.json from ModemManager and a carrier bundle.
 ModemManager provides the subscriber and device identity (IMSI, MSISDN,
 IMEI, MCC/MNC). Operator specifics (IMS domain, transport, headers) come
 from carrier-bundles/<digits>.json, picked by the longest IMSI prefix; with no
-bundle the 3GPP discovery names (TS 23.003) are used. The P-CSCF is per ePDG
-session, so it has to be passed in.
+bundle the 3GPP discovery names (TS 23.003) are used. The P-CSCF changes with
+every ePDG session, so it is normally passed to nekoims with -p; --pcscf here
+stores one in the file instead.
 
-    python3 tools/mkconfig.py --pcscf 2001:4888:4:3108:b0:104:0:1053
-    python3 tools/mkconfig.py --pcscf <addr> -o nekoims.json [--force]
+    python3 tools/mkconfig.py -o nekoims.json [--force]
+    sudo ip netns exec ims ./build/nekoims -c nekoims.json -p <pcscf>
 
 Needs no root: ModemManager exposes these properties to any user.
 """
@@ -113,8 +114,9 @@ def e164(number: str, mcc: str) -> str | None:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--pcscf", required=True,
-                    help="P-CSCF address from the ePDG tunnel")
+    ap.add_argument("--pcscf", default=None,
+                    help="store this P-CSCF in the file (normally given to "
+                         "nekoims with -p instead)")
     ap.add_argument("--modem", default=None,
                     help="ModemManager modem index, D-Bus path or IMEI "
                          "(default: first modem)")
@@ -166,7 +168,8 @@ def main():
     if msisdn:
         cfg["msisdn"] = msisdn
     cfg["impi"] = f"{imsi}@{bundle['domain']}"
-    cfg["pcscf"] = args.pcscf
+    if args.pcscf:
+        cfg["pcscf"] = args.pcscf
     for key in CONFIG_KEYS:
         if key in bundle and key not in cfg:
             cfg[key] = bundle[key]
@@ -186,6 +189,8 @@ def main():
         sys.stdout.write(text)
 
     log(f"modem {modem}, carrier: {bundle.get('name', '?')} [{source}]")
+    if not args.pcscf:
+        log("start nekoims with -p <pcscf> (from the ePDG dialer)")
     if bundle.get("epdg"):
         log(f"ePDG dialer: epdg={bundle['epdg']} apn={bundle.get('apn', 'ims')}"
             f" mcc={mcc} mnc={mnc}")
