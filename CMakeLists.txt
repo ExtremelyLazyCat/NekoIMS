@@ -286,6 +286,7 @@ endif()
 set(MODULES
   ${NEKOIMS_PLATFORM_MODULES}
   amr
+  aubridge
   auconv
   aufile
   auresamp
@@ -373,6 +374,7 @@ endif()
 
 add_executable(nekoims
   src/main.cpp
+  src/b2bua.cpp
   src/ims_register.cpp
   src/simcard_client.cpp
 )

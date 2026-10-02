@@ -8,5 +8,12 @@
   "imei": "000000000000000",
   "p_access_network_info": "IEEE-802.11;country=US;i-wlan-node-id=ffffffffffff",
   "expires": 600000,
-  "sip_trace": false
+  "sip_trace": false,
+  "b2bua": {
+    "enabled": false,
+    "username": "nekoims",
+    "password": "change-me",
+    "target": "",
+    "audio_codecs": "PCMU/8000,PCMA/8000"
+  }
 }

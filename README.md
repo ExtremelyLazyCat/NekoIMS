@@ -26,3 +26,15 @@ Copy nekoims.example.json to nekoims.json and edit
 * Domain (ims.mnc<MNC>.mcc<MCC>.pub.3gppnetwork.org) or vzwims.com for Verizon  
 * pcscf (from VPN or whatever value is relevant to your ims bearer if directly attached)
 * msisdn (to your phone number)
+### B2BUA mode
+With `"b2bua": {"enabled": true, ...}` NekoIMS runs headless and bridges calls
+to an external SIP UA (desk phone, softphone, PBX trunk) instead of the sound
+card. This is useful for peering with asterisk or using gnome-calls or another softphone. Note that this mode is likely filled with bugs.
+
+* `username` / `password`: digest credentials the external UA uses for its
+  REGISTER and INVITEs (no `password` means no authentication, only do that
+  on a trusted network)
+* `target`: optional fixed URI for incoming IMS calls, used when no UA is
+  registered, e.g. `sip:100@192.168.1.20:5060`
+* `audio_codecs`: codecs offered to the external UA (default
+  `PCMU/8000,PCMA/8000`; `AMR-WB/16000` and `AMR/8000` also available)

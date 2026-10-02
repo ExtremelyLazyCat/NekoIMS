@@ -3,7 +3,8 @@
 // Loads a JSON config, brings up libcurl, libre and baresip (with the AMR and
 // G.711 codecs statically linked in), then registers to the IMS core through
 // the P-CSCF handed to us by the ePDG dialer. REGISTER and its IMS-AKA
-// challenge are handled by ImsRegistration; baresip handles calls.
+// challenge are handled by ImsRegistration; baresip handles calls, either
+// on the local sound card or, in B2BUA mode, bridged to an external SIP UA.
 #include "platform.h"
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include <re.h>
 #include <baresip.h>
 
+#include "b2bua.h"
 #include "ims_register.h"
 #include "simcard_client.h"
 
@@ -50,9 +52,12 @@ struct Settings {
     uint32_t expires = 600000;
     bool debug = false;
     bool sip_trace = false;
+    bool b2bua = false;  // headless, calls bridged to an external UA
+    nekoims::B2buaConfig b2bua_cfg;
 };
 
 nekoims::ImsRegistration* g_reg = nullptr;
+struct ua* g_ims_ua = nullptr;
 std::string g_bye_hdrs;  // see bye_headers_handler()
 
 void usage(const char* argv0) {
@@ -106,6 +111,17 @@ bool load_settings(const std::string& path, Settings& out) {
                 "+sip.instance=\"<{imei_urn}>\"",
                 "audio",
             };
+
+        if (j.contains("b2bua")) {
+            const nlohmann::json& b = j["b2bua"];
+            nekoims::B2buaConfig& c = out.b2bua_cfg;
+
+            out.b2bua = b.value("enabled", out.b2bua);
+            c.username = b.value("username", c.username);
+            c.password = b.value("password", c.password);
+            c.target = b.value("target", c.target);
+            c.audio_codecs = b.value("audio_codecs", c.audio_codecs);
+        }
     } catch (const nlohmann::json::exception& e) {
         std::fprintf(stderr, "nekoims: bad config '%s': %s\n", path.c_str(),
                      e.what());
@@ -178,24 +194,46 @@ std::string baresip_config(const Settings& s) {
         c << "sip_listen\t" << s.sip_listen << "\n";
     else
         c << "sip_listen\t0.0.0.0:" << s.sip_port << "\n";
-    if (!s.ifname.empty()) c << "net_interface\t" << s.ifname << "\n";
+    // The interface filter would also hide the LAN addresses the external
+    // UA is reached on.
+    if (!s.ifname.empty() && !s.b2bua)
+        c << "net_interface\t" << s.ifname << "\n";
     if (s.pcscf.find(':') != std::string::npos) c << "net_prefer_ipv6\tyes\n";
 
-    c << "audio_player\t" << kAudioModule << "," << s.audio_device << "\n"
-      << "audio_source\t" << kAudioModule << "," << s.audio_device << "\n"
-      << "audio_alert\t" << kAudioModule << "," << s.audio_device << "\n";
+    if (s.b2bua) {
+        // Both legs of a call are cross-connected through aubridge, which
+        // needs one sample format on both sides; auresamp converts each
+        // codec to it. B2bua accepts INVITEs itself (to authenticate them).
+        c << "audio_player\taubridge,nil\n"
+          << "audio_source\taubridge,nil\n"
+          << "audio_alert\taubridge,nil\n"
+          << "auplay_srate\t16000\n"
+          << "ausrc_srate\t16000\n"
+          << "auplay_channels\t1\n"
+          << "ausrc_channels\t1\n"
+          << "call_accept\tno\n";
+    } else {
+        c << "audio_player\t" << kAudioModule << "," << s.audio_device << "\n"
+          << "audio_source\t" << kAudioModule << "," << s.audio_device << "\n"
+          << "audio_alert\t" << kAudioModule << "," << s.audio_device << "\n";
+    }
 
     // stdio/wincons + menu: interactive keys (d = dial, a = answer, b = hangup)
     // misleading names aside, these modules aren't *actually* loaded from disk,
     // they're statically linked in. The module.so declarations are still
-    // necessary for baresip to use them, though.
-    c << "module\t" << kConsoleModule << ".so\n"
-      << "module\tmenu.so\n"
-      << "module\tg711.so\n"
+    // necessary for baresip to use them, though. B2BUA mode is headless: the
+    // menu would accept, answer and ring calls on its own.
+    if (!s.b2bua)
+        c << "module\t" << kConsoleModule << ".so\n"
+          << "module\tmenu.so\n"
+          << "module\t" << kAudioModule << ".so\n";
+    else
+        c << "module\taubridge.so\n";
+
+    c << "module\tg711.so\n"
       << "module\tamr.so\n"
       << "module\tauconv.so\n"
       << "module\tauresamp.so\n"
-      << "module\t" << kAudioModule << ".so\n"
       << "module\tausine.so\n"
       << "module\taufile.so\n";
 
@@ -259,11 +297,12 @@ void early_media_fix_handler(enum bevent_ev ev, struct bevent* event,
 // closer to the iPhone VoWiFi behavior, which is a good thing.
 //
 // Needs call_set_close_headers() from patches/baresip. libre also sends these
-// on our 200 OK when the peer hangs up.
+// on our 200 OK when the peer hangs up. IMS calls only, not B2BUA LAN legs.
 void bye_headers_handler(enum bevent_ev ev, struct bevent* event, void* arg) {
     (void)arg;
 
     if (ev != BEVENT_CALL_ANSWERED && ev != BEVENT_CALL_ESTABLISHED) return;
+    if (call_get_ua(bevent_get_call(event)) != g_ims_ua) return;
 
     int err = call_set_close_headers(bevent_get_call(event), "%s",
                                      g_bye_hdrs.c_str());
@@ -368,6 +407,7 @@ int main(int argc, char* argv[]) {
 
     nekoims::SimcardClient sim(settings.simcard_server);
     std::unique_ptr<nekoims::ImsRegistration> reg;
+    std::unique_ptr<nekoims::B2bua> b2bua;
     nekoims::ImsRegConfig rc;
     struct ua* ua = NULL;
     const std::string conf = baresip_config(settings);
@@ -398,6 +438,10 @@ int main(int argc, char* argv[]) {
     if (!settings.pani.empty())
         rc.headers.push_back(std::make_pair(
             std::string("P-Access-Network-Info"), settings.pani));
+
+    if (settings.b2bua && !settings.ifname.empty())
+        warning("nekoims: b2bua: ignoring \"interface\" (%s)\n",
+                settings.ifname.c_str());
 
     if (imei_urn(settings.imei).empty())
         warning(
@@ -447,6 +491,7 @@ int main(int argc, char* argv[]) {
         warning("nekoims: account setup failed: %m\n", err);
         goto out;
     }
+    g_ims_ua = ua;
 
     // IMS headers for requests baresip sends (INVITE etc.), TS 24.229 5.1.2A
     {
@@ -479,6 +524,16 @@ int main(int argc, char* argv[]) {
         }
     }
 
+    if (settings.b2bua) {
+        settings.b2bua_cfg.ims_domain = settings.domain;
+        b2bua.reset(new nekoims::B2bua(settings.b2bua_cfg, ua));
+        err = b2bua->start();
+        if (err) {
+            warning("nekoims: b2bua setup failed: %m\n", err);
+            goto out;
+        }
+    }
+
     reg.reset(new nekoims::ImsRegistration(uag_sip(), rc, sim));
     g_reg = reg.get();
 
@@ -493,6 +548,7 @@ int main(int argc, char* argv[]) {
 out:
     g_reg = nullptr;
     reg.reset();
+    b2bua.reset();
 
     bevent_unregister(bye_headers_handler);
     bevent_unregister(early_media_fix_handler);
