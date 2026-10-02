@@ -672,7 +672,11 @@ def main():
                  "src/libcharon/plugins/vici/python)")
 
     sim = SimClient(args.simcard)
-    imsi = sim.imsi()
+    try:
+        imsi = sim.imsi()
+    except (OSError, RuntimeError, KeyError, ValueError) as e:
+        sys.exit(f"cannot get the IMSI from the SIM server on {args.simcard}: "
+                 f"{e}")
     mcc = imsi[:3]
     mnc_len = args.mnc_len or (3 if mcc in NANP_MCCS else 2)
     mnc = imsi[3:3 + mnc_len]
