@@ -11,7 +11,13 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
 
+
+set(CMAKE_XCODE_ATTRIBUTE_RANLIBFLAGS "-c")
+
 option(NEKOIMS_FULLY_STATIC "Link libc and libstdc++ statically too (-static)" ON)
+if(APPLE)
+  set(NEKOIMS_FULLY_STATIC OFF CACHE BOOL "Linking libc and libstdc++ statically is not supported on macOS" FORCE)
+endif()
 option(NEKOIMS_WITH_PCSC "Build pcsc-lite client library for simcard-server" OFF)
 
 # MSVC has no -static; the equivalent is the static CRT (/MT), which has to
@@ -173,6 +179,8 @@ set(AMR_CONFIGURE_ARGS
   --with-pic
   CC=${CMAKE_C_COMPILER}
   CXX=${CMAKE_CXX_COMPILER}
+  AR=${CMAKE_AR}
+  RANLIB=${CMAKE_RANLIB}
 )
 
 ExternalProject_Add(opencore_amr_ext
@@ -209,14 +217,14 @@ endif()
 
 ##############################################################################
 #
-# alsa-lib (autotools, built out of tree; not used on Windows, see wasapi)
+# alsa-lib (autotools, built out of tree; not used on Windows or macOS, see wasapi and coreaudio respectively)
 #
 # Config files are read from the host at runtime. Plugins that live in shared
 # objects (pipewire, pulse) can't be loaded by a static binary, so use a
 # hardware device such as plughw:0,0.
 #
 
-if(NOT WIN32)
+if(NOT WIN32 AND NOT APPLE)
 
 set(ALSA_PREFIX "${CMAKE_BINARY_DIR}/_deps/alsa-install")
 
@@ -280,6 +288,8 @@ set(STATIC ON CACHE BOOL "" FORCE)
 # Audio driver and console UI are per platform; main.cpp picks the same ones.
 if(WIN32)
   set(NEKOIMS_PLATFORM_MODULES wasapi wincons)
+elseif(APPLE)
+  set(NEKOIMS_PLATFORM_MODULES coreaudio stdio)
 else()
   set(NEKOIMS_PLATFORM_MODULES alsa stdio)
 endif()
@@ -320,8 +330,12 @@ FetchContent_Declare(baresip
 FetchContent_MakeAvailable(baresip)
 
 if(NOT WIN32)
+  # TODO: figure out how to use native core audio amr codec on macos
+  # (opencore works fine but it just feels wrong when its in core audio)
   add_dependencies(amr opencore_amr_ext vo_amrwbenc_ext)
-  add_dependencies(alsa alsa_lib_ext)
+  if(NOT APPLE)
+    add_dependencies(alsa alsa_lib_ext)
+  endif()
 endif()
 
 ##############################################################################
@@ -399,7 +413,9 @@ if(NEKOIMS_WITH_PCSC)
   target_link_libraries(nekoims PRIVATE pcsclite)
 endif()
 
-if(MSVC)
+if(APPLE)
+  target_link_libraries(nekoims PRIVATE "-framework CoreAudio" "-framework AudioToolbox")
+elseif(MSVC)
   # Static CRT is selected by CMAKE_MSVC_RUNTIME_LIBRARY above.
 elseif(NEKOIMS_FULLY_STATIC)
   target_link_options(nekoims PRIVATE -static)
