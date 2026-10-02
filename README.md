@@ -8,8 +8,9 @@ NekoIMS is a portable IMS client built on top of BareSIP in C++11
 ```
 Builds NekoIMS if needed, starts the SIM server for the attached SIM (PC/SC
 reader or ModemManager modem, `--sim pcsc|mm` to choose), generates the config
-with `tools/mkconfig.py` for a modem SIM (a PC/SC SIM uses
-`/etc/nekoims/config.json`), dials the ePDG with the static
+from the SIM with `tools/mkconfig.py` (a carrier bundle if there is one for the
+SIM, else the 3GPP discovery names, provided the ePDG resolves; it asks for the
+phone number if the SIM doesn't carry it), dials the ePDG with the static
 [neko-strongswan](https://github.com/MercuryWorkshop/neko-strongswan) build and
 runs NekoIMS inside the tunnel's `ims` netns, using the P-CSCF the ePDG
 assigned. It asks for sudo after building. `./start.sh --help` lists the

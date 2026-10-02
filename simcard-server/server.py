@@ -87,6 +87,11 @@ class Usim:
 
     def _select_usim(self, conn):
         """Find the USIM AID in EF.DIR and SELECT it (TS 31.102)."""
+        self._select_app(conn, USIM_AID_PREFIX, "USIM")
+
+    def _select_app(self, conn, aid_prefix: bytes, name: str):
+        """SELECT the first EF.DIR application whose AID starts with
+        aid_prefix (USIM, or ISIM for TS 31.103)."""
         self._xmit(conn, bytes([0x00, 0xA4, 0x00, 0x04, 0x02, 0x2F, 0x00]))
         for rec in range(1, 16):
             data, sw1, _ = self._xmit(conn, bytes([0x00, 0xB2, rec, 0x04, 0x00]))
@@ -96,13 +101,13 @@ class Usim:
             if i < 0 or i + 1 >= len(data):
                 continue
             aid = data[i + 2:i + 2 + data[i + 1]]
-            if aid.startswith(USIM_AID_PREFIX):
+            if aid.startswith(aid_prefix):
                 apdu = bytes([0x00, 0xA4, 0x04, 0x04, len(aid)]) + aid + b"\x00"
                 _, sw1, sw2 = self._xmit(conn, apdu)
                 if sw1 != 0x90:
-                    raise CardError(f"SELECT USIM failed: SW={sw1:02X}{sw2:02X}")
+                    raise CardError(f"SELECT {name} failed: SW={sw1:02X}{sw2:02X}")
                 return
-        raise CardError("no USIM application found in EF.DIR")
+        raise CardError(f"no {name} application found in EF.DIR")
 
     def _read_ef(self, conn, fid: bytes, length: int) -> bytes:
         apdu = bytes([0x00, 0xA4, 0x00, 0x04, len(fid)]) + fid + b"\x00"
