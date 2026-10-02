@@ -37,6 +37,41 @@ baresip's remote control interfaces are both off by default, but can be enabled 
 Neither one supports auth, so anyone who can connect can place calls. Keep
 them on localhost.
 
+### SMS
+SMS over IMS in both directions, in 3GPP (`application/vnd.3gpp.sms`) or
+3GPP2 (`application/vnd.3gpp2.sms`, which Verizon uses) format. Received SMS
+are acknowledged to the network and handed to baresip as `text/plain`
+messages (console, ctrl_tcp `message` events), and in B2BUA mode also relayed
+to the external UA.
+
+```json
+"sms": { "rx": "plain", "tx": "plain", "format": "auto", "smsc": "" }
+```
+
+* `rx`: what SIP clients receive. `plain` is the decoded text; SMS without a
+  text form (WAP push, binary data) fall back to `binary_b64`, the original
+  bytes as a data URI: `data:application/vnd.3gpp2.sms;base64,...`
+* `tx`: what SIP clients send. `plain` text is encoded into an SMS here;
+  `binary_b64` expects the same data URI form. A MESSAGE that is already
+  `application/vnd.3gpp(2).sms` is sent as is either way
+* `format`: `auto` sends in the format SMS were last received in (3GPP until
+  one arrives), or force `3gpp` / `3gpp2`
+* `smsc`: service centre URI or number to send to. By default, wherever the
+  last received SMS came from
+* `off` for `rx` or `tx` disables that direction
+
+You can also send with the `sms` command, from the console, ctrl_tcp
+(`{"command":"sms","params":"+15551234567 hi"}`) or httpd, or in B2BUA mode
+with a SIP MESSAGE from the external UA to `<number>@<NekoIMS>`. The network's
+verdict arrives as an SMS of its own: with `rx` `plain` it's reported as an
+`sms` module event (`sent` / `failed`), with `binary_b64` it's delivered as
+is. Only single-part messages can be sent for now (160 characters, or 70
+outside the GSM/ASCII character set).
+
+Unless `contact_features` is set explicitly, `+g.3gpp.smsip` is added to the
+registration string so the network delivers the SMS over IMS. If you set
+`contact_features`, add it yourself.
+
 ### B2BUA mode
 With `"b2bua": {"enabled": true, ...}` NekoIMS runs headless and bridges calls
 to an external SIP UA (desk phone, softphone, PBX trunk) instead of the sound

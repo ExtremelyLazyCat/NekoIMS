@@ -40,7 +40,7 @@ SIMCARD_SERVER_DEFAULT = "unix:/run/nekoims/simcard.sock"
 
 # Bundle keys copied into nekoims.json as-is.
 CONFIG_KEYS = ("domain", "transport", "pcscf_port", "p_access_network_info",
-               "contact_features", "expires", "user_agent")
+               "contact_features", "expires", "user_agent", "sms")
 
 # MCCs in the North American Numbering Plan (+1).
 NANP_MCCS = {"302"} | {str(m) for m in range(310, 317)}

@@ -24,6 +24,7 @@
 #include "b2bua.h"
 #include "ims_register.h"
 #include "simcard_client.h"
+#include "sms.h"
 
 namespace {
 
@@ -56,6 +57,7 @@ struct Settings {
     std::string ctrl_tcp_listen = "127.0.0.1:4444";
     bool httpd = false;
     std::string http_listen = "127.0.0.1:8000";
+    nekoims::SmsConfig sms;  // SMS over IMS, see sms.h
     bool b2bua = false;  // headless, calls bridged to an external UA
     nekoims::B2buaConfig b2bua_cfg;
 };
@@ -74,6 +76,44 @@ void usage(const char* argv0) {
                  "  -t         SIP trace\n"
                  "  -h         Show this help\n",
                  NEKOIMS_VERSION, argv0, kDefaultConfigPath);
+}
+
+bool sms_mode(const nlohmann::json& j, const char* key,
+              nekoims::SmsConfig::Mode& out) {
+    const std::string v = j.value(key, std::string("plain"));
+    if (v == "plain")
+        out = nekoims::SmsConfig::Plain;
+    else if (v == "binary_b64")
+        out = nekoims::SmsConfig::BinaryB64;
+    else if (v == "off")
+        out = nekoims::SmsConfig::Off;
+    else
+        return false;
+    return true;
+}
+
+// "sms": {"rx": "plain", "tx": "plain", "format": "auto", "smsc": ""}
+bool sms_settings(const nlohmann::json& j, nekoims::SmsConfig& out,
+                  const std::string& path) {
+    const std::string format = j.value("format", std::string("auto"));
+    out.smsc = j.value("smsc", out.smsc);
+
+    if (format == "3gpp")
+        out.format = nekoims::sms::Format::Gpp;
+    else if (format == "3gpp2")
+        out.format = nekoims::sms::Format::Gpp2;
+    else if (format != "auto") {
+        std::fprintf(stderr, "nekoims: %s: sms.format must be auto, 3gpp or "
+                     "3gpp2\n", path.c_str());
+        return false;
+    }
+
+    if (!sms_mode(j, "rx", out.rx) || !sms_mode(j, "tx", out.tx)) {
+        std::fprintf(stderr, "nekoims: %s: sms.rx and sms.tx must be plain, "
+                     "binary_b64 or off\n", path.c_str());
+        return false;
+    }
+    return true;
 }
 
 bool load_settings(const std::string& path, Settings& out) {
@@ -110,6 +150,15 @@ bool load_settings(const std::string& path, Settings& out) {
         out.httpd = j.value("httpd", out.httpd);
         out.http_listen = j.value("http_listen", out.http_listen);
 
+        if (j.contains("sms") &&
+            !sms_settings(j["sms"], out.sms, path))
+            return false;
+        if (j.contains("sms_mode"))
+            std::fprintf(stderr,
+                         "nekoims: %s: \"sms_mode\" is gone, use "
+                         "\"sms\": {\"rx\": ..., \"tx\": ...}\n",
+                         path.c_str());
+
         if (j.contains("contact_features"))
             out.contact_features =
                 j["contact_features"].get<std::vector<std::string> >();
@@ -119,6 +168,10 @@ bool load_settings(const std::string& path, Settings& out) {
                 "+sip.instance=\"<{imei_urn}>\"",
                 "audio",
             };
+        // Without it the network keeps SMS off IMS (TS 24.341 5.3.1.2)
+        if (out.sms.rx != nekoims::SmsConfig::Off &&
+            !j.contains("contact_features"))
+            out.contact_features.push_back("+g.3gpp.smsip");
 
         if (j.contains("b2bua")) {
             const nlohmann::json& b = j["b2bua"];
@@ -425,6 +478,7 @@ int main(int argc, char* argv[]) {
     nekoims::SimcardClient sim(settings.simcard_server);
     std::unique_ptr<nekoims::ImsRegistration> reg;
     std::unique_ptr<nekoims::B2bua> b2bua;
+    std::unique_ptr<nekoims::Sms> sms;
     nekoims::ImsRegConfig rc;
     struct ua* ua = NULL;
     const std::string conf = baresip_config(settings);
@@ -490,6 +544,23 @@ int main(int argc, char* argv[]) {
 
     if (trace || settings.sip_trace) uag_enable_sip_trace(true);
 
+    // Before conf_modules(), so it sees MESSAGE ahead of baresip
+    if (settings.sms.rx != nekoims::SmsConfig::Off ||
+        settings.sms.tx != nekoims::SmsConfig::Off) {
+        nekoims::SmsConfig sc = settings.sms;
+        sc.deliver = !settings.b2bua || settings.ctrl_tcp;  // menu/ctrl_tcp
+        sc.impu = rc.impu;
+        sc.domain = settings.domain;
+        sc.outbound = rc.outbound;
+        sc.pani = settings.pani;
+        sms.reset(new nekoims::Sms(uag_sip(), sc));
+        err = sms->start();
+        if (err) {
+            warning("nekoims: sms setup failed: %m\n", err);
+            goto out;
+        }
+    }
+
     err = conf_modules();
     if (err) {
         warning("nekoims: loading modules failed: %m\n", err);
@@ -549,10 +620,22 @@ int main(int argc, char* argv[]) {
             warning("nekoims: b2bua setup failed: %m\n", err);
             goto out;
         }
+
+        if (sms) {
+            nekoims::B2bua* b = b2bua.get();
+            nekoims::SmsLan lan;
+            lan.ua = b->lan_ua();
+            lan.authorized = [b](const struct sip_msg* m) {
+                return b->authorized(m);
+            };
+            lan.target = [b]() { return b->lan_target(); };
+            sms->set_lan(lan);
+        }
     }
 
     reg.reset(new nekoims::ImsRegistration(uag_sip(), rc, sim));
     g_reg = reg.get();
+    if (sms) sms->set_ims(reg.get(), ua);
 
     err = reg->start();
     if (err) {
@@ -564,6 +647,7 @@ int main(int argc, char* argv[]) {
 
 out:
     g_reg = nullptr;
+    sms.reset();
     reg.reset();
     b2bua.reset();
 

@@ -11,6 +11,12 @@
   "sip_trace": false,
   "ctrl_tcp": false,
   "ctrl_tcp_listen": "127.0.0.1:4444",
+  "sms": {
+    "rx": "plain",
+    "tx": "plain",
+    "format": "auto",
+    "smsc": ""
+  },
   "httpd": false,
   "http_listen": "127.0.0.1:8000",
   "b2bua": {

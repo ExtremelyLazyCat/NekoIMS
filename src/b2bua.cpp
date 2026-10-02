@@ -2,6 +2,9 @@
 // It is a better implementation of the same idea though! Basically acts as a server,
 // letting you use NekoIMS as an SIP proxy or trunk with your existing SIP client.
 
+// This is basically the standin replacement for what BadTelephony was, but it's also 
+// just like better in every way.
+
 #include "b2bua.h"
 
 #include <cstring>

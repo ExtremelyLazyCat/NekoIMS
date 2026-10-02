@@ -32,6 +32,11 @@ class B2bua {
 
     int start();
 
+    // For SMS from/to the external UA
+    struct ua* lan_ua() const { return lan_ua_; }
+    bool authorized(const struct sip_msg* msg);  // replies 401/403 itself
+    std::string lan_target();                    // "" if none
+
    private:
     struct Session {
         B2bua* owner;
@@ -55,12 +60,10 @@ class B2bua {
     void on_event(enum bevent_ev ev, struct bevent* event);
     void on_connect(const struct sip_msg* msg);
     void on_register(const struct sip_msg* msg);
-    bool authorized(const struct sip_msg* msg);
     void new_session(struct ua* ua, struct call* call);
     void close_session(std::list<Session>::iterator it, struct call* closed,
                        const char* text);
     std::list<Session>::iterator find(const struct call* call);
-    std::string lan_target();
 
     B2buaConfig cfg_;
     struct ua* ims_ua_;
