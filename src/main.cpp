@@ -30,6 +30,8 @@ namespace {
 
 const char* const kDefaultConfigPath = "/etc/nekoims/config.json";
 const char* const kDefaultSimcardServer = "unix:/run/nekoims/simcard.sock";
+// Written by the ePDG dialer while its tunnel is up, one P-CSCF per line.
+const char* const kPcscfFile = "/run/nekoims/pcscf";
 const char* const kMmtelIcsi = "urn%3Aurn-7%3A3gpp-service.ims.icsi.mmtel";
 const int kAsyncWorkers = 4;
 
@@ -71,11 +73,26 @@ void usage(const char* argv0) {
                  "NekoIMS %s\n"
                  "Usage: %s [-c config.json] [-p pcscf] [-v] [-t] [-h]\n"
                  "  -c <path>  Config file (default: %s)\n"
-                 "  -p <addr>  P-CSCF from the ePDG dialer (overrides config)\n"
+                 "  -p <addr>  P-CSCF (overrides config; default: config, then\n"
+                 "             the first line of %s)\n"
                  "  -v         Verbose/debug logging\n"
                  "  -t         SIP trace\n"
                  "  -h         Show this help\n",
-                 NEKOIMS_VERSION, argv0, kDefaultConfigPath);
+                 NEKOIMS_VERSION, argv0, kDefaultConfigPath, kPcscfFile);
+}
+
+// First address in the dialer's P-CSCF file, skipping blank and # lines.
+bool read_pcscf_file(const char* path, std::string& out) {
+    std::ifstream in(path);
+    std::string line;
+    while (std::getline(in, line)) {
+        const size_t b = line.find_first_not_of(" \t\r");
+        if (b == std::string::npos || line[b] == '#') continue;
+        const size_t e = line.find_last_not_of(" \t\r");
+        out = line.substr(b, e - b + 1);
+        return true;
+    }
+    return false;
 }
 
 bool sms_mode(const nlohmann::json& j, const char* key,
@@ -451,11 +468,15 @@ int main(int argc, char* argv[]) {
     Settings settings;
     if (!load_settings(config_path, settings)) return EXIT_FAILURE;
     if (!pcscf.empty()) settings.pcscf = pcscf;
+    if (settings.pcscf.empty() &&
+        read_pcscf_file(kPcscfFile, settings.pcscf))
+        std::fprintf(stderr, "nekoims: using P-CSCF %s from %s\n",
+                     settings.pcscf.c_str(), kPcscfFile);
     if (settings.pcscf.empty()) {
         std::fprintf(stderr,
-                     "nekoims: no P-CSCF, pass -p <addr> or set \"pcscf\" in "
-                     "%s\n",
-                     config_path.c_str());
+                     "nekoims: no P-CSCF, pass -p <addr>, set \"pcscf\" in "
+                     "%s or bring up the ePDG dialer (%s)\n",
+                     config_path.c_str(), kPcscfFile);
         return EXIT_FAILURE;
     }
 
