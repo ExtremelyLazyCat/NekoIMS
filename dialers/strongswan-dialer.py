@@ -226,35 +226,71 @@ def ip(*args, check=True):
 
 
 class Tunnel:
-    """XFRM interface carrying if_id IF_ID, living in `netns`."""
+    """XFRM interface carrying if_id IF_ID, living in `netns`.
+
+    With an empty netns the interface stays in the current namespace (e.g. a
+    container that also has to reach a LAN): traffic from the tunnel address
+    goes through it via a policy rule, and it becomes the IPv6 default route
+    only if there is no other one, so the LAN side and IKE keep their routes.
+    """
 
     def __init__(self, netns: str, ifname: str, mtu: int):
         self.netns, self.ifname, self.mtu = netns, ifname, mtu
+        self.vips: list[str] = []
+        self.main_v6_default = False
+
+    def _ip(self, *args, check=True):
+        ns = ("-n", self.netns) if self.netns else ()
+        return ip(*ns, *args, check=check)
 
     def create(self):
-        if self.netns not in ip("netns", "list").stdout.split():
+        if self.netns and self.netns not in ip("netns", "list").stdout.split():
             ip("netns", "add", self.netns)
-        ip("-n", self.netns, "link", "del", self.ifname, check=False)
+        self._ip("link", "del", self.ifname, check=False)
         ip("link", "add", self.ifname, "type", "xfrm", "if_id", hex(IF_ID))
-        ip("link", "set", self.ifname, "netns", self.netns)
-        ip("-n", self.netns, "link", "set", "lo", "up")
-        ip("-n", self.netns, "link", "set", self.ifname,
-           "mtu", str(self.mtu), "up")
+        if self.netns:
+            ip("link", "set", self.ifname, "netns", self.netns)
+            self._ip("link", "set", "lo", "up")
+        self._ip("link", "set", self.ifname, "mtu", str(self.mtu), "up")
 
     def configure(self, vips: list[str]):
-        ip("-n", self.netns, "addr", "flush", "dev", self.ifname)
+        self.unconfigure()
         for vip in vips:
             v6 = ":" in vip
-            ip("-n", self.netns, "addr", "add",
-               f"{vip}/{128 if v6 else 32}", "dev", self.ifname)
-            ip("-n", self.netns, "-6" if v6 else "-4", "route", "replace",
-               "default", "dev", self.ifname)
+            fam = "-6" if v6 else "-4"
+            self._ip("addr", "add", f"{vip}/{128 if v6 else 32}",
+                     "dev", self.ifname)
+            if self.netns:
+                self._ip(fam, "route", "replace", "default", "dev",
+                         self.ifname)
+                continue
+            ip(fam, "rule", "add", "from", vip, "lookup", str(IF_ID),
+               "priority", str(IF_ID))
+            ip(fam, "route", "replace", "default", "dev", self.ifname,
+               "table", str(IF_ID))
+            if v6 and not ip("-6", "route", "show", "default").stdout.strip():
+                ip("-6", "route", "add", "default", "dev", self.ifname)
+                self.main_v6_default = True
+        self.vips = vips
 
     def unconfigure(self):
-        ip("-n", self.netns, "addr", "flush", "dev", self.ifname, check=False)
+        self._ip("addr", "flush", "dev", self.ifname, check=False)
+        if self.netns:
+            return
+        for vip in self.vips:
+            fam = "-6" if ":" in vip else "-4"
+            ip(fam, "rule", "del", "from", vip, "lookup", str(IF_ID),
+               check=False)
+            ip(fam, "route", "flush", "table", str(IF_ID), check=False)
+        if self.main_v6_default:
+            ip("-6", "route", "del", "default", "dev", self.ifname,
+               check=False)
+            self.main_v6_default = False
+        self.vips = []
 
     def destroy(self):
-        ip("-n", self.netns, "link", "del", self.ifname, check=False)
+        self.unconfigure()
+        self._ip("link", "del", self.ifname, check=False)
 
 
 # -- charon ------------------------------------------------------------------
@@ -480,15 +516,29 @@ def load_cas(session, paths: list[str]) -> int:
     return n
 
 
+def epdg_addrs(epdg: str, family: str) -> list[str]:
+    """The ePDG host, or its addresses of one family (e.g. IPv4 only from a
+    container whose IPv6 default route is the tunnel itself)."""
+    if family == "any":
+        return [epdg]
+    af = socket.AF_INET if family == "4" else socket.AF_INET6
+    try:
+        infos = socket.getaddrinfo(epdg, 500, af, socket.SOCK_DGRAM)
+    except socket.gaierror as e:
+        sys.exit(f"cannot resolve {epdg} to IPv{family}: {e}")
+    return list(dict.fromkeys(i[4][0] for i in infos))
+
+
 def connection(epdg: str, identity: str, remote_id: str, remote_auth: str,
-               bundle: dict, encap: bool = True) -> dict:
+               bundle: dict, encap: bool = True,
+               family: str = "any") -> dict:
     return {CONN: {
         "version": "2",
         # Always carry ESP in UDP 4500, like phones do. Without a NAT (e.g.
         # IPv6) charon would send raw ESP (IP protocol 50), which home
         # routers' firewalls commonly drop: IKE comes up but no data flows.
         "encap": "yes" if encap else "no",
-        "remote_addrs": [epdg],
+        "remote_addrs": epdg_addrs(epdg, family),
         # Request INTERNAL_IP4/6_ADDRESS; with the p-cscf plugin loaded
         # charon also asks for P_CSCF_IP4/6_ADDRESS.
         "vips": ["0.0.0.0", "::"],
@@ -584,7 +634,12 @@ def main():
                          f"(default: {CA_BUNDLE_DEFAULT})")
     ap.add_argument("--aka-backend", choices=sorted(AKA_BACKENDS),
                     default="http")
-    ap.add_argument("--netns", default="ims")
+    ap.add_argument("--netns", default="ims",
+                    help='netns for the tunnel interface, "" to keep it in '
+                         "the current one (e.g. in a container)")
+    ap.add_argument("--epdg-family", choices=("any", "4", "6"),
+                    default="any",
+                    help="reach the ePDG over this IP version only")
     ap.add_argument("--ifname", default="ims0")
     ap.add_argument("--mtu", type=int, default=1400)
     ap.add_argument("--charon", default=None, help="charon binary")
@@ -671,7 +726,8 @@ def main():
             log(f"loaded {n} CA certificates")
         cmd.load_conn(connection(epdg, identity, args.remote_id or apn,
                                  remote_auth, bundle,
-                                 encap=not args.no_encap))
+                                 encap=not args.no_encap,
+                                 family=args.epdg_family))
 
         events = charon.session()
         while True:
@@ -692,7 +748,8 @@ def main():
                                      "vips": vips, "pcscf": pcscfs,
                                      "epdg": epdg, "imsi": imsi})
             write_pcscf(pcscf_path, pcscfs)
-            log(f"tunnel up: {args.netns}/{args.ifname} {' '.join(vips)}")
+            log(f"tunnel up: {args.netns or '-'}/{args.ifname} "
+                f"{' '.join(vips)}")
             for p in pcscfs:
                 print(f"PCSCF={p}", flush=True)
 
