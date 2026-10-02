@@ -52,6 +52,10 @@ struct Settings {
     uint32_t expires = 600000;
     bool debug = false;
     bool sip_trace = false;
+    bool ctrl_tcp = false;
+    std::string ctrl_tcp_listen = "127.0.0.1:4444";
+    bool httpd = false;
+    std::string http_listen = "127.0.0.1:8000";
     bool b2bua = false;  // headless, calls bridged to an external UA
     nekoims::B2buaConfig b2bua_cfg;
 };
@@ -101,6 +105,10 @@ bool load_settings(const std::string& path, Settings& out) {
         out.expires = j.value("expires", out.expires);
         out.debug = j.value("debug", out.debug);
         out.sip_trace = j.value("sip_trace", out.sip_trace);
+        out.ctrl_tcp = j.value("ctrl_tcp", out.ctrl_tcp);
+        out.ctrl_tcp_listen = j.value("ctrl_tcp_listen", out.ctrl_tcp_listen);
+        out.httpd = j.value("httpd", out.httpd);
+        out.http_listen = j.value("http_listen", out.http_listen);
 
         if (j.contains("contact_features"))
             out.contact_features =
@@ -236,6 +244,15 @@ std::string baresip_config(const Settings& s) {
       << "module\tauresamp.so\n"
       << "module\tausine.so\n"
       << "module\taufile.so\n";
+
+    // Commands come from the menu module, which B2BUA mode doesn't load;
+    // there these mostly just report events (ctrl_tcp).
+    if (s.ctrl_tcp)
+        c << "module\tctrl_tcp.so\n"
+          << "ctrl_tcp_listen\t" << s.ctrl_tcp_listen << "\n";
+    if (s.httpd)
+        c << "module\thttpd.so\n"
+          << "http_listen\t" << s.http_listen << "\n";
 
     c << "amr_mode\t8\n";
 

@@ -26,6 +26,17 @@ Copy nekoims.example.json to nekoims.json and edit
 * Domain (ims.mnc<MNC>.mcc<MCC>.pub.3gppnetwork.org) or vzwims.com for Verizon  
 * pcscf (from VPN or whatever value is relevant to your ims bearer if directly attached)
 * msisdn (to your phone number)
+### Control sockets
+baresip's remote control interfaces are both off by default, but can be enabled as follows
+* `"ctrl_tcp": true`: JSON commands and events over netstrings on
+  `ctrl_tcp_listen` (default `127.0.0.1:4444`), e.g.
+  `{"command":"dial","params":"+15551234567"}`
+* `"httpd": true`: menu commands over HTTP on `http_listen` (default
+  `127.0.0.1:8000`), e.g. `curl 'http://127.0.0.1:8000/?d+15551234567'`
+
+Neither one supports auth, so anyone who can connect can place calls. Keep
+them on localhost.
+
 ### B2BUA mode
 With `"b2bua": {"enabled": true, ...}` NekoIMS runs headless and bridges calls
 to an external SIP UA (desk phone, softphone, PBX trunk) instead of the sound

@@ -9,6 +9,10 @@
   "p_access_network_info": "IEEE-802.11;country=US;i-wlan-node-id=ffffffffffff",
   "expires": 600000,
   "sip_trace": false,
+  "ctrl_tcp": false,
+  "ctrl_tcp_listen": "127.0.0.1:4444",
+  "httpd": false,
+  "http_listen": "127.0.0.1:8000",
   "b2bua": {
     "enabled": false,
     "username": "nekoims",

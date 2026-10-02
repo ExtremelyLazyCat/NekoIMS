@@ -291,7 +291,9 @@ set(MODULES
   aufile
   auresamp
   ausine
+  ctrl_tcp
   g711
+  httpd
   menu
   CACHE STRING "baresip modules linked into NekoIMS" FORCE
 )
