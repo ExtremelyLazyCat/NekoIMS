@@ -337,6 +337,20 @@ class Charon:
                 sys.exit("charon did not open its vici socket")
             time.sleep(0.1)
 
+    def check(self):
+        """Exit if charon died; there is nothing left to redial with."""
+        rc = self.proc.poll() if self.proc else None
+        if rc is None:
+            return
+        if rc < 0:
+            try:
+                why = f"killed by {signal.Signals(-rc).name}"
+            except ValueError:
+                why = f"killed by signal {-rc}"
+        else:
+            why = f"exited with {rc}"
+        sys.exit(f"charon {why}")
+
     def session(self):
         import vici
         sock = socket.socket(socket.AF_UNIX)
@@ -467,9 +481,13 @@ def load_cas(session, paths: list[str]) -> int:
 
 
 def connection(epdg: str, identity: str, remote_id: str, remote_auth: str,
-               bundle: dict) -> dict:
+               bundle: dict, encap: bool = True) -> dict:
     return {CONN: {
         "version": "2",
+        # Always carry ESP in UDP 4500, like phones do. Without a NAT (e.g.
+        # IPv6) charon would send raw ESP (IP protocol 50), which home
+        # routers' firewalls commonly drop: IKE comes up but no data flows.
+        "encap": "yes" if encap else "no",
         "remote_addrs": [epdg],
         # Request INTERNAL_IP4/6_ADDRESS; with the p-cscf plugin loaded
         # charon also asks for P_CSCF_IP4/6_ADDRESS.
@@ -555,6 +573,9 @@ def main():
     ap.add_argument("--apn", default=None, help="APN (default: bundle or ims)")
     ap.add_argument("--remote-id", default=None,
                     help="IDr to send (default: the APN)")
+    ap.add_argument("--no-encap", action="store_true",
+                    help="send raw ESP when there is no NAT instead of "
+                         "always encapsulating it in UDP 4500")
     ap.add_argument("--remote-auth", choices=("pubkey", "eap"), default=None,
                     help="how the ePDG authenticates (default: bundle "
                          "epdg_auth, else pubkey)")
@@ -649,7 +670,8 @@ def main():
             n = load_cas(cmd, args.ca or [CA_BUNDLE_DEFAULT])
             log(f"loaded {n} CA certificates")
         cmd.load_conn(connection(epdg, identity, args.remote_id or apn,
-                                 remote_auth, bundle))
+                                 remote_auth, bundle,
+                                 encap=not args.no_encap))
 
         events = charon.session()
         while True:
@@ -657,6 +679,7 @@ def main():
                 pcscfs = initiate(cmd)
             except Exception as e:  # vici.exception.CommandException
                 log(f"initiate failed: {e}")
+                charon.check()
                 if not args.retry:
                     sys.exit(1)
                 time.sleep(args.retry)
@@ -674,9 +697,13 @@ def main():
                 print(f"PCSCF={p}", flush=True)
 
             # Block until the IKE SA goes away, then redial.
-            for kind, msg in events.listen(["ike-updown"]):
-                if CONN in msg and s(msg.get("up", b"no")) != "yes":
-                    break
+            try:
+                for kind, msg in events.listen(["ike-updown"]):
+                    if CONN in msg and s(msg.get("up", b"no")) != "yes":
+                        break
+            except Exception:  # vici connection lost
+                charon.check()
+                raise
             log("tunnel down")
             tunnel.unconfigure()
             write_state(state_path, None)

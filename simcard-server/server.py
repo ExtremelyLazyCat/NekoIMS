@@ -235,6 +235,21 @@ class ThreadingTCPHTTPServer(socketserver.ThreadingMixIn,
     allow_reuse_address = True
 
 
+def unix_socket_in_use(path: str) -> bool:
+    """Whether another server is accepting on path. Two servers sharing the
+    card interleave APDUs (e.g. SELECT failing with 6F00), and starting one
+    would unlink the other's socket."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(1)
+        s.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def make_server(listen: str | None, unix_path: str):
     if listen:
         host, _, port = listen.rpartition(":")
@@ -261,6 +276,8 @@ def main():
     ap.add_argument("--listen", default=None,
                     help="listen on TCP HOST:PORT instead of the Unix socket")
     args = ap.parse_args()
+    if not args.listen and unix_socket_in_use(args.unix):
+        sys.exit(f"another SIM server is already serving {args.unix}")
 
     Handler.usim = Usim(args.reader)
     try:

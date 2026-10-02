@@ -1,6 +1,19 @@
 # NekoIMS
 NekoIMS is a portable IMS client built on top of BareSIP in C++11 
 
+### Quick start (Linux, VoWiFi)
+```
+./start.sh
+```
+Builds NekoIMS if needed, starts the SIM server for the attached SIM (PC/SC
+reader or ModemManager modem, `--sim pcsc|mm` to choose), generates the config
+with `tools/mkconfig.py` for a modem SIM (a PC/SC SIM uses
+`/etc/nekoims/config.json`), dials the ePDG with the static
+[neko-strongswan](https://github.com/MercuryWorkshop/neko-strongswan) build and
+runs NekoIMS inside the tunnel's `ims` netns, using the P-CSCF the ePDG
+assigned. It asks for sudo after building. `./start.sh --help` lists the
+options; arguments after `--` go to nekoims.
+
 ### Dependencies (should be populated via cmake)
 * libcurl
 * BareSIP

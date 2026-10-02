@@ -506,6 +506,21 @@ def make_tcp_server(listen: str, cert: str | None, key: str | None):
     return srv, f"https://{listen}"
 
 
+def unix_socket_in_use(path: str) -> bool:
+    """Whether another server is accepting on path. Two servers sharing the
+    card interleave APDUs (e.g. SELECT failing with 6F00), and starting one
+    would unlink the other's socket."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        s.settimeout(1)
+        s.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
 def make_unix_server(unix_path: str):
     os.makedirs(os.path.dirname(unix_path), mode=0o750, exist_ok=True)
     if os.path.exists(unix_path):
@@ -548,6 +563,8 @@ def main():
     if os.geteuid() != 0:
         sys.exit("mm_server must run as root: qmi-proxy only accepts root "
                  "clients")
+    if not args.no_unix and unix_socket_in_use(args.unix):
+        sys.exit(f"another SIM server is already serving {args.unix}")
 
     modem = Modem(args.modem)
     chan = QmiUimChannel(args.slot,
