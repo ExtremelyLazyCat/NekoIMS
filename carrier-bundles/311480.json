@@ -26,6 +26,7 @@
     "Outgoing calls: the reliable 183 carries the SDP answer, then a 180 and 200 OK without SDP (handled by the early media workaround in main.cpp).",
     "BYEs must carry Reason \"User Triggered\", P-Access-Network-Info and P-Preferred-Identity, or Google Pixels and LTE-attached SIMs get stuck (src/bye_reason.cpp).",
     "SMS arrives as SIP MESSAGE with application/vnd.3gpp2.sms (C.S0015), from tel:910090009000;phone-context=vzims.com. Needs +g.3gpp.smsip in the Contact. Sent SMS go out in 3GPP2 format too (sms.format), to that same address (sms.smsc).",
-    "Use UDP. Over TCP the P-CSCF drops the registration's connection and network-initiated requests (incoming SMS, the SMS delivery report) never arrive, so outgoing SMS and calls work but nothing comes in."
+    "Use UDP. Over TCP the P-CSCF drops the registration's connection and network-initiated requests (incoming SMS, the SMS delivery report) never arrive, so outgoing SMS and calls work but nothing comes in.",
+    "Keep sip_port at 5060: with the contact on another port, registration, SMS and in-dialog requests still work, but Verizon never sends incoming calls (callers get voicemail)."
   ]
 }
