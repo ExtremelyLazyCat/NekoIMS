@@ -237,8 +237,7 @@ log "P-CSCF: $(head -n1 "$PCSCF_FILE")"
 log "starting NekoIMS in netns $NETNS"
 set +e
 
-echo ip netns exec "$NETNS" "$BUILD/nekoims" -c "$CONFIG" "${NEKOIMS_ARGS[@]}" 9>&-
-bash
+ip netns exec "$NETNS" "$BUILD/nekoims" -c "$CONFIG" "${NEKOIMS_ARGS[@]}" 9>&-
 RC=$?
 set -e
 exit "$RC"
