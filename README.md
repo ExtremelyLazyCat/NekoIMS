@@ -1,4 +1,5 @@
-# NekoIMS
+![NekoIMS](/gh-assets/nekoims-banner.jpg)
+
 NekoIMS is a portable IMS client built on top of BareSIP in C++11 
 
 ### Quick start (Linux, VoWiFi)
