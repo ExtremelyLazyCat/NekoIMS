@@ -22,6 +22,7 @@
 #include <baresip.h>
 
 #include "b2bua.h"
+#include "netns.h"
 #include "ims_register.h"
 #include "simcard_client.h"
 #include "sms.h"
@@ -216,6 +217,13 @@ bool load_settings(const std::string& path, Settings& out) {
             c.password = b.value("password", c.password);
             c.target = b.value("target", c.target);
             c.audio_codecs = b.value("audio_codecs", c.audio_codecs);
+            c.listen = b.value("listen", c.listen);
+            c.netns = b.value("netns", c.netns);
+            if (!c.netns.empty() && c.listen.empty()) {
+                std::fprintf(stderr, "nekoims: %s: b2bua.netns needs "
+                             "b2bua.listen\n", path.c_str());
+                return false;
+            }
         }
     } catch (const nlohmann::json::exception& e) {
         std::fprintf(stderr, "nekoims: bad config '%s': %s\n", path.c_str(),
@@ -290,8 +298,8 @@ std::string baresip_config(const Settings& s) {
     else
         c << "sip_listen\t0.0.0.0:" << s.sip_port << "\n";
     // The interface filter would also hide the LAN addresses the external
-    // UA is reached on.
-    if (!s.ifname.empty() && !s.b2bua)
+    // UA is reached on; with b2bua.listen that one is added back in main().
+    if (!s.ifname.empty() && (!s.b2bua || !s.b2bua_cfg.listen.empty()))
         c << "net_interface\t" << s.ifname << "\n";
     if (s.pcscf.find(':') != std::string::npos) c << "net_prefer_ipv6\tyes\n";
 
@@ -412,6 +420,19 @@ void bye_headers_handler(enum bevent_ev ev, struct bevent* event, void* arg) {
     if (err) warning("nekoims: cannot set BYE headers: %m\n", err);
 }
 
+struct Laddr {
+    std::string ifname;
+    struct sa sa;
+};
+
+bool collect_laddr(const char* ifname, const struct sa* sa, void* arg) {
+    Laddr l;
+    l.ifname = ifname ? ifname : "?";
+    l.sa = *sa;
+    static_cast<std::vector<Laddr>*>(arg)->push_back(l);
+    return false;
+}
+
 void reg_stopped(void* arg) {
     (void)arg;
     re_cancel();
@@ -514,6 +535,7 @@ int main(int argc, char* argv[]) {
 
     nekoims::SimcardClient sim(settings.simcard_server);
     std::unique_ptr<nekoims::ImsRegistration> reg;
+    std::unique_ptr<nekoims::Netns> netns;  // b2bua.netns
     std::unique_ptr<nekoims::B2bua> b2bua;
     std::unique_ptr<nekoims::Sms> sms;
     nekoims::ImsRegConfig rc;
@@ -561,9 +583,12 @@ int main(int argc, char* argv[]) {
         rc.headers.push_back(std::make_pair(
             std::string("P-Access-Network-Info"), settings.pani));
 
-    if (settings.b2bua && !settings.ifname.empty())
-        warning("nekoims: b2bua: ignoring \"interface\" (%s)\n",
-                settings.ifname.c_str());
+    if (settings.b2bua && !settings.ifname.empty() &&
+        settings.b2bua_cfg.listen.empty())
+        warning(
+            "nekoims: b2bua: ignoring \"interface\" (%s), set b2bua.listen "
+            "to keep it and add the external UA's address\n",
+            settings.ifname.c_str());
 
     if (imei_urn(settings.imei).empty())
         warning(
@@ -585,6 +610,75 @@ int main(int argc, char* argv[]) {
         goto out;
     }
 
+    // b2bua.listen: ua_init() below opens SIP sockets on each of baresip's
+    // addresses, so reduce them to the listen address plus the IMS side (the
+    // interface's addresses, or else just the one the P-CSCF is reached
+    // from). The listen address can be anything bindable, e.g. 127.0.0.2,
+    // which interface enumeration would never list.
+    //
+    // It goes first: libre sends from the socket whose address the kernel
+    // would route from, else the first one of the right family. The IMS side
+    // always matches its route, the external UA may not (127.0.0.2 talking
+    // to 127.0.0.1 is routed from 127.0.0.1).
+    //
+    // With b2bua.netns the listen address is in another namespace, so its
+    // sockets are opened there after ua_init(). libre still picks sockets by
+    // routing in this namespace, which can't see that one; it only keeps
+    // them apart by address family. So the IMS side drops the listen
+    // address's family, and must not need it for the P-CSCF.
+    if (settings.b2bua && !settings.b2bua_cfg.listen.empty()) {
+        struct network* net = baresip_network();
+        const bool other_ns = !settings.b2bua_cfg.netns.empty();
+        std::vector<Laddr> ims;
+        struct sa lan, pcscf;
+
+        if (sa_set_str(&lan, settings.b2bua_cfg.listen.c_str(), 0)) {
+            warning("nekoims: b2bua.listen must be an IP address: %s\n",
+                    settings.b2bua_cfg.listen.c_str());
+            err = EINVAL;
+            goto out;
+        }
+
+        if (sa_set_str(&pcscf, settings.pcscf.c_str(), settings.pcscf_port)) {
+            warning("nekoims: b2bua.listen: P-CSCF must be an IP address\n");
+            err = EINVAL;
+            goto out;
+        }
+        if (other_ns && sa_af(&pcscf) == sa_af(&lan)) {
+            warning("nekoims: b2bua.netns: the P-CSCF (%j) and b2bua.listen "
+                    "(%j) are both %s; in another namespace the listen "
+                    "address must be the other IP version\n",
+                    &pcscf, &lan, sa_af(&lan) == AF_INET ? "IPv4" : "IPv6");
+            err = EINVAL;
+            goto out;
+        }
+
+        if (!settings.ifname.empty()) {
+            net_laddr_apply(net, collect_laddr, &ims);
+        } else {
+            Laddr l;
+            l.ifname = "ims";
+            if (net_dst_source_addr_get(&pcscf, &l.sa)) {
+                warning("nekoims: b2bua.listen: no route to the P-CSCF %s, "
+                        "set \"interface\"\n", settings.pcscf.c_str());
+                err = EHOSTUNREACH;
+                goto out;
+            }
+            ims.push_back(l);
+        }
+
+        net_flush_addresses(net);
+        if (!other_ns) err = net_add_address_ifname(net, &lan, "b2bua");
+        for (size_t i = 0; !err && i < ims.size(); ++i) {
+            if (other_ns && sa_af(&ims[i].sa) == sa_af(&lan)) continue;
+            err = net_add_address_ifname(net, &ims[i].sa, ims[i].ifname.c_str());
+        }
+        if (err) {
+            warning("nekoims: b2bua.listen: cannot set addresses: %m\n", err);
+            goto out;
+        }
+    }
+
     err = ua_init(settings.user_agent.c_str(), true, true, false);
     if (err) {
         warning("nekoims: ua init failed: %m\n", err);
@@ -592,6 +686,37 @@ int main(int argc, char* argv[]) {
     }
 
     uag_set_exit_handler(uag_exit_handler, NULL);
+
+    // b2bua.netns: the external UA's SIP sockets, opened in its namespace.
+    // The address is also given to baresip for picking media addresses,
+    // after ua_init() so baresip opens no SIP socket on it here.
+    if (settings.b2bua && !settings.b2bua_cfg.netns.empty()) {
+        struct sa lan, sip;
+        uint16_t port = settings.sip_port;
+        if (!settings.sip_listen.empty() &&
+            !sa_decode(&sip, settings.sip_listen.c_str(),
+                       settings.sip_listen.size()))
+            port = sa_port(&sip);
+        (void)sa_set_str(&lan, settings.b2bua_cfg.listen.c_str(), port);
+
+        netns.reset(new nekoims::Netns());
+        err = netns->open(settings.b2bua_cfg.netns);
+        if (err) goto out;
+
+        {
+            nekoims::NetnsScope in_lan(netns.get(), true);
+            err = sip_transp_add(uag_sip(), SIP_TRANSP_UDP, &lan);
+            if (!err) err = sip_transp_add(uag_sip(), SIP_TRANSP_TCP, &lan);
+        }
+        if (!err) err = net_add_address_ifname(baresip_network(), &lan, "b2bua");
+        if (err) {
+            warning("nekoims: b2bua: cannot listen on %J in %s: %m\n", &lan,
+                    settings.b2bua_cfg.netns.c_str(), err);
+            goto out;
+        }
+        info("nekoims: b2bua: listening on %J in %s\n", &lan,
+             settings.b2bua_cfg.netns.c_str());
+    }
 
     if (trace || settings.sip_trace) uag_enable_sip_trace(true);
 
@@ -673,6 +798,7 @@ int main(int argc, char* argv[]) {
     if (settings.b2bua) {
         settings.b2bua_cfg.ims_domain = settings.domain;
         b2bua.reset(new nekoims::B2bua(settings.b2bua_cfg, ua));
+        b2bua->set_netns(netns.get());
         err = b2bua->start();
         if (err) {
             warning("nekoims: b2bua setup failed: %m\n", err);

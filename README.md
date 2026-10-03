@@ -97,5 +97,13 @@ card. This is useful for peering with asterisk or using gnome-calls or another s
   on a trusted network)
 * `target`: optional fixed URI for incoming IMS calls, used when no UA is
   registered, e.g. `sip:100@192.168.1.20:5060`
+* `listen`: optional address (no port, `sip_port` is used) to serve the
+  external UA on, e.g. `127.0.0.2` or `192.168.1.10`. NekoIMS then binds SIP
+  only there and on the IMS side: the `interface` addresses if set, else
+  just the address the P-CSCF is reached from. Requests for the external
+  UA's account arriving anywhere else are refused. Without `listen`, NekoIMS
+  binds every address and `interface` is ignored in this mode
+* `netns` (Linux): network namespace `listen` is in, as a path
+  (`/proc/1/ns/net` for the host's) or a name from `/run/netns`.
 * `audio_codecs`: codecs offered to the external UA (default
   `PCMU/8000,PCMA/8000`; `AMR-WB/16000` and `AMR/8000` also available)

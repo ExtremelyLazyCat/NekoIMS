@@ -390,6 +390,7 @@ endif()
 
 add_executable(nekoims
   src/main.cpp
+  src/netns.cpp
   src/b2bua.cpp
   src/ims_register.cpp
   src/ipsec.cpp

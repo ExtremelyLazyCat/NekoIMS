@@ -60,6 +60,31 @@ const char* reject_reason(uint16_t scode) {
     }
 }
 
+// baresip puts a call's RTP on the local address the kernel routes to the
+// peer from, and refuses the call when that isn't one of its addresses. With
+// b2bua.listen it can be missing: 127.0.0.2 serving a client on 127.0.0.1 is
+// routed from 127.0.0.1. Add it for media; SIP sockets are only opened in
+// ua_init(), so SIP still listens on b2bua.listen alone.
+void add_media_laddr(const struct sa* peer) {
+    struct network* net = baresip_network();
+    struct sa src;
+
+    if (!sa_isset(peer, SA_ADDR) || net_laddr_for(net, peer)) return;
+    if (net_dst_source_addr_get(peer, &src)) return;
+    if (!net_add_address_ifname(net, &src, "b2bua-media"))
+        info("b2bua: RTP for %j from %j\n", peer, &src);
+}
+
+// Media address of an SDP offer, else where the request came from
+void offer_addr(const struct sip_msg* msg, struct sa* out) {
+    struct pl addr;
+    *out = msg->src;
+    if (!re_regex(reinterpret_cast<const char*>(mbuf_buf(msg->mb)),
+                  mbuf_get_left(msg->mb), "c=IN IP[46]1 [^ \r\n]+", NULL,
+                  &addr))
+        (void)sa_set(out, &addr, 0);
+}
+
 }  // namespace
 
 B2bua::B2bua(const B2buaConfig& cfg, struct ua* ims_ua)
@@ -71,11 +96,20 @@ B2bua::~B2bua() {
 
     // Calls belong to their UAs and are closed by ua_stop_all()
     for (std::list<Session>::iterator it = sessions_.begin();
-         it != sessions_.end(); ++it)
+         it != sessions_.end(); ++it) {
         tmr_cancel(&it->tmr);
+        tmr_cancel(&it->rebridge_tmr);
+    }
 }
 
 int B2bua::start() {
+    sa_init(&listen_, AF_UNSPEC);
+    if (!cfg_.listen.empty() && sa_set_str(&listen_, cfg_.listen.c_str(), 0)) {
+        warning("b2bua: listen must be an IP address: %s\n",
+                cfg_.listen.c_str());
+        return EINVAL;
+    }
+
     // catchall: every INVITE the IMS account doesn't match lands here
     std::string aor = "<sip:" + cfg_.username + "@" + kLanHost + ">" +
                       ";regint=0;catchall=yes;answermode=manual" +
@@ -100,8 +134,9 @@ int B2bua::start() {
             "b2bua: no password set, anyone who can reach the SIP port can "
             "call through this line\n");
 
-    info("b2bua: ready, LAN account %s (%s)\n", cfg_.username.c_str(),
-         cfg_.audio_codecs.c_str());
+    info("b2bua: ready, LAN account %s (%s) on %s\n", cfg_.username.c_str(),
+         cfg_.audio_codecs.c_str(),
+         cfg_.listen.empty() ? "any address" : cfg_.listen.c_str());
 
     return 0;
 }
@@ -151,15 +186,24 @@ void B2bua::on_event(enum bevent_ev ev, struct bevent* event) {
     int err = 0;
 
     switch (ev) {
+        case BEVENT_CALL_RINGING:
+        case BEVENT_CALL_REMOTE_SDP:
+            // May have restarted this leg's audio, see rebridge_handler()
+            tmr_start(&s.rebridge_tmr, 0, rebridge_handler, &s);
+            break;
+
         case BEVENT_CALL_PROGRESS:
-            // Early media (ringback, announcements) toward the caller
+            // Early media (ringback, announcements) toward the caller.
+            // Not call_progress(): that takes the direction from the
+            // account's answermode, which is manual here (inactive).
             if (call == s.out && call_state(s.in) == CALL_STATE_INCOMING)
-                err = call_progress(s.in);
+                err = call_progress_dir(s.in, SDP_SENDRECV, SDP_INACTIVE);
             if (err) warning("b2bua: early media relay failed: %m\n", err);
             break;
 
         case BEVENT_CALL_ESTABLISHED:
             // Via the timer, like rejects, to stay out of this event
+            tmr_start(&s.rebridge_tmr, 0, rebridge_handler, &s);
             if (call != s.out) break;
             s.answer_tries = 0;
             tmr_start(&s.tmr, 0, answer_handler, &s);
@@ -188,6 +232,16 @@ void B2bua::on_connect(const struct sip_msg* msg) {
     struct ua* ua = uag_find_msg(msg);
 
     if (ua == lan_ua_ && !authorized(msg)) return;
+
+    // The external UA's leg is set up in its namespace (b2bua.netns), so
+    // its RTP sockets and media address lookups land there.
+    NetnsScope ns(netns_, ua == lan_ua_);
+
+    if (ua == lan_ua_) {
+        struct sa peer;
+        offer_addr(msg, &peer);
+        add_media_laddr(&peer);
+    }
 
     // ua_accept() replies 500 itself on failure
     int err = ua_accept(ua, msg);
@@ -249,6 +303,15 @@ void B2bua::on_register(const struct sip_msg* msg) {
 
 // Digest auth for requests from the external UA. Replies 401/403 itself.
 bool B2bua::authorized(const struct sip_msg* msg) {
+    // msg->dst is the local socket it arrived on; SIP sockets are bound per
+    // address, so this is exact.
+    if (sa_isset(&listen_, SA_ADDR) && !sa_cmp(&msg->dst, &listen_, SA_ADDR)) {
+        info("b2bua: %r from %J to %j rejected, not on %j\n", &msg->met,
+             &msg->src, &msg->dst, &listen_);
+        (void)sip_treply(NULL, uag_sip(), msg, 403, "Forbidden");
+        return false;
+    }
+
     if (cfg_.password.empty()) return true;
 
     struct sip_uas_auth auth;
@@ -290,6 +353,7 @@ void B2bua::new_session(struct ua* ua, struct call* call) {
     s.scode = 0;
     s.answer_tries = 0;
     tmr_init(&s.tmr);
+    tmr_init(&s.rebridge_tmr);
 
     std::string from, to;
     if (ua == lan_ua_) {
@@ -317,6 +381,20 @@ void B2bua::new_session(struct ua* ua, struct call* call) {
     }
 
     if (s.ua_out) {
+        // Each leg in its own namespace (see on_connect()). This runs from
+        // inside ua_accept() of the other leg, so the IMS leg would
+        // otherwise inherit the external UA's namespace.
+        NetnsScope ns(netns_, s.ua_out == lan_ua_);
+
+        if (s.ua_out == lan_ua_) {
+            struct pl pl;
+            struct uri u;
+            struct sa peer;
+            pl_set_str(&pl, to.c_str());
+            if (!uri_decode(&u, &pl) && !sa_set(&peer, &u.host, 0))
+                add_media_laddr(&peer);
+        }
+
         int err = ua_connect(s.ua_out, &s.out,
                              from.empty() ? NULL : from.c_str(), to.c_str(),
                              VIDMODE_OFF);
@@ -356,6 +434,29 @@ void B2bua::reject_handler(void* arg) {
 
 // Answering the caller can be refused while it still owes us a PRACK for
 // the early media 183, so keep retrying for a few seconds.
+// The legs share aubridge devices (one's player, the other's source), and
+// freeing either one detaches both from the device. baresip frees a leg's
+// audio when it restarts it: the SDP-less 18x/200 workaround in main.cpp
+// (which runs before this, on the same events), a re-INVITE. The other leg
+// is then left connected to nothing and the call goes silent both ways. So
+// after such events, restart both legs' audio together: with every source
+// and player new, each device ends up with both again.
+void B2bua::rebridge_handler(void* arg) {
+    Session* s = static_cast<Session*>(arg);
+    struct audio* a = s->in ? call_audio(s->in) : NULL;
+    struct audio* b = s->out ? call_audio(s->out) : NULL;
+
+    // Only a running bridge can be broken; one still starting attaches
+    // to the device when it starts.
+    if (!a || !b || !audio_started(a) || !audio_started(b)) return;
+
+    audio_stop(a);
+    audio_stop(b);
+    int err = call_update_media(s->in);
+    if (!err) err = call_update_media(s->out);
+    if (err) warning("b2bua: cannot restart audio: %m\n", err);
+}
+
 void B2bua::answer_handler(void* arg) {
     Session* s = static_cast<Session*>(arg);
 
@@ -378,6 +479,7 @@ void B2bua::answer_handler(void* arg) {
 void B2bua::close_session(std::list<Session>::iterator it,
                           struct call* closed, const char* text) {
     tmr_cancel(&it->tmr);
+    tmr_cancel(&it->rebridge_tmr);
 
     const bool in = closed == it->in;
     struct ua* ua = in ? it->ua_out : it->ua_in;

@@ -15,6 +15,8 @@
 #include <re.h>
 #include <baresip.h>
 
+#include "netns.h"
+
 namespace nekoims {
 
 struct B2buaConfig {
@@ -22,6 +24,8 @@ struct B2buaConfig {
     std::string password;              // empty: no authentication
     std::string target;  // fixed URI for IMS-terminated calls (optional)
     std::string audio_codecs = "PCMU/8000,PCMA/8000";  // LAN leg
+    std::string listen;  // only accept the external UA on this address
+    std::string netns;   // listen is in this network namespace (Linux)
     std::string ims_domain;  // request URIs for + toward IMS
 };
 
@@ -37,6 +41,9 @@ class B2bua {
     bool authorized(const struct sip_msg* msg);  // replies 401/403 itself
     std::string lan_target();                    // "" if none
 
+    // Namespace the external UA's side lives in, see b2bua.netns
+    void set_netns(Netns* ns) { netns_ = ns; }
+
    private:
     struct Session {
         B2bua* owner;
@@ -47,6 +54,7 @@ class B2bua {
         uint16_t scode;    // reject code when out couldn't be dialed
         unsigned answer_tries;
         struct tmr tmr;  // deferred reject or answer, used in new_session()
+        struct tmr rebridge_tmr;  // see rebridge_handler()
     };
 
     static void event_handler(enum bevent_ev ev, struct bevent* event,
@@ -56,6 +64,7 @@ class B2bua {
                            const char* realm, void* arg);
     static void reject_handler(void* arg);
     static void answer_handler(void* arg);
+    static void rebridge_handler(void* arg);
 
     void on_event(enum bevent_ev ev, struct bevent* event);
     void on_connect(const struct sip_msg* msg);
@@ -68,6 +77,8 @@ class B2bua {
     B2buaConfig cfg_;
     struct ua* ims_ua_;
     struct ua* lan_ua_ = nullptr;
+    struct sa listen_;  // unset: any local address
+    Netns* netns_ = nullptr;
     struct sip_lsnr* lsnr_ = nullptr;
     bool bevent_ = false;
 
