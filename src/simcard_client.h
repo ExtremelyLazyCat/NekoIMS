@@ -22,8 +22,10 @@ class SimcardClient {
     explicit SimcardClient(const std::string& endpoint);
 
     bool imsi(std::string& out, std::string& error) const;
+    // app: "isim" or "usim", the application that runs IMS AKA
     AkaResult authenticate(const std::vector<uint8_t>& rand,
-                           const std::vector<uint8_t>& autn) const;
+                           const std::vector<uint8_t>& autn,
+                           const std::string& app = "isim") const;
 
    private:
     bool get(const std::string& query, std::string& body,

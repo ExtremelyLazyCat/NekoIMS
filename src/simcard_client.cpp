@@ -119,11 +119,16 @@ bool SimcardClient::imsi(std::string& out, std::string& error) const {
 }
 
 AkaResult SimcardClient::authenticate(const std::vector<uint8_t>& rand,
-                                      const std::vector<uint8_t>& autn) const {
+                                      const std::vector<uint8_t>& autn,
+                                      const std::string& app) const {
     AkaResult r;
     std::string body;
 
-    if (!get("type=rand-autn&rand=" + to_hex(rand) + "&autn=" + to_hex(autn),
+    // IMS AKA runs on the ISIM where there is one (TS 33.203 6.1), unless
+    // the operator's keys only work on the USIM; servers that don't know
+    // "app" use the USIM.
+    if (!get("type=rand-autn&rand=" + to_hex(rand) + "&autn=" + to_hex(autn) +
+                 "&app=" + app,
              body, r.error))
         return r;
 

@@ -1,0 +1,115 @@
+--- a/include/baresip.h
++++ b/include/baresip.h
+@@ -1007,6 +1007,8 @@
+ int  ua_add_custom_hdr(struct ua *ua, const struct pl *name,
+ 		       const struct pl *value);
+ int  ua_rm_custom_hdr(struct ua *ua, struct pl *name);
++int  ua_set_resp_headers(struct ua *ua, const char *hdrs);
++const char *ua_resp_headers(const struct ua *ua);
+ int  ua_enable_autoanswer(struct ua *ua, int32_t adelay,
+ 		enum answer_method met);
+ int  ua_disable_autoanswer(struct ua *ua, enum answer_method met);
+--- a/src/call.c
++++ b/src/call.c
+@@ -1308,9 +1308,10 @@
+ 
+ 	err = sipsess_progress(call->sess, 183, "Session Progress",
+ 			       account_rel100_mode(call->acc),
+-			       desc, "Allow: %H\r\n%H",
++			       desc, "Allow: %H\r\n%H%s",
+ 			       ua_print_allowed, call->ua,
+-			       ua_print_require, call->ua);
++			       ua_print_require, call->ua,
++			       ua_resp_headers(call->ua));
+ 
+ 	call->progr_queued = (err == EAGAIN);
+ 	if (err)
+@@ -1398,12 +1399,14 @@
+ 	if (scode >= 200 && scode < 300) {
+ 		err = sipsess_answer(call->sess, scode, "Answering", desc,
+ 				"Allow: %H\r\n"
+-				"%H", ua_print_allowed, call->ua,
+-				ua_print_supported, call->ua);
++				"%H%s", ua_print_allowed, call->ua,
++				ua_print_supported, call->ua,
++				ua_resp_headers(call->ua));
+ 	}
+ 	else {
+ 		err = sipsess_answer(call->sess, scode, "Answering", desc,
+-				"Allow: %H\r\n", ua_print_allowed, call->ua);
++				"Allow: %H\r\n%s", ua_print_allowed, call->ua,
++				ua_resp_headers(call->ua));
+ 	}
+ 
+ 	if (err)
+@@ -2525,9 +2528,10 @@
+ 			     sipsess_estab_handler, sipsess_info_handler,
+ 			     call->acc->refer ? sipsess_refer_handler : NULL,
+ 			     sipsess_close_handler,
+-			     call, "Allow: %H\r\n%H",
++			     call, "Allow: %H\r\n%H%s",
+ 			     ua_print_allowed, call->ua,
+-			     ua_print_require, call->ua);
++			     ua_print_require, call->ua,
++			     ua_resp_headers(call->ua));
+ 
+ 	if (err) {
+ 		warning("call: sipsess_accept: %m\n", err);
+--- a/src/ua.c
++++ b/src/ua.c
+@@ -29,6 +29,7 @@
+ 	struct list hdr_filter;      /**< Filter for incoming headers        */
+ 	char *ansval;                /**< SIP auto answer value              */
+ 	struct sa dst;               /**< Current destination address        */
++	char *resp_hdrs;             /**< Headers for responses to INVITE    */
+ };
+ 
+ struct ua_xhdr_filter {
+@@ -58,6 +59,7 @@
+ 	mem_deref(ua->cuser);
+ 	mem_deref(ua->pub_gruu);
+ 	mem_deref(ua->ansval);
++	mem_deref(ua->resp_hdrs);
+ 	mem_deref(ua->acc);
+ 
+ 	if (uag_delayed_close() && list_isempty(uag_list())) {
+@@ -1932,6 +1934,39 @@
+  *
+  * @return Contact user
+  */
++/**
++ * Set SIP headers for the responses to incoming INVITEs (180, 183, 2xx),
++ * e.g. P-Access-Network-Info (3GPP TS 24.229 5.1.4.2)
++ *
++ * @param ua   User-Agent object
++ * @param hdrs Headers, each ending in CRLF, or NULL to clear
++ *
++ * @return 0 if success, otherwise errorcode
++ */
++int ua_set_resp_headers(struct ua *ua, const char *hdrs)
++{
++	if (!ua)
++		return EINVAL;
++
++	ua->resp_hdrs = mem_deref(ua->resp_hdrs);
++
++	return hdrs ? str_dup(&ua->resp_hdrs, hdrs) : 0;
++}
++
++
++/**
++ * Get the SIP headers for responses to incoming INVITEs
++ *
++ * @param ua User-Agent object
++ *
++ * @return Headers (empty string if none)
++ */
++const char *ua_resp_headers(const struct ua *ua)
++{
++	return ua && ua->resp_hdrs ? ua->resp_hdrs : "";
++}
++
++
+ const char *ua_cuser(const struct ua *ua)
+ {
+ 	if (!ua)

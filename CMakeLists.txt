@@ -392,6 +392,7 @@ add_executable(nekoims
   src/main.cpp
   src/b2bua.cpp
   src/ims_register.cpp
+  src/ipsec.cpp
   src/simcard_client.cpp
   src/sms.cpp
   src/sms_codec.cpp

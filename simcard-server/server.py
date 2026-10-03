@@ -10,8 +10,10 @@ API (compatible with https://github.com/fasferraz/USIM-https-server, plain HTTP)
   GET /?type=imsi
       -> {"imsi": "311480..."}
 
-  GET /?type=rand-autn&rand=<32 hex>&autn=<32 hex>
+  GET /?type=rand-autn&rand=<32 hex>&autn=<32 hex>[&app=isim]
       -> {"res": "<hex>", "ck": "<hex>", "ik": "<hex>"}
+      app=isim (an extension, for IMS AKA) runs it on the ISIM, or on the
+      USIM if the card has no ISIM.
       On AKA synchronisation failure (AUTS in "res", as SWu-IKEv2 expects;
       "auts" is an extension):
       -> {"res": "<auts>", "ck": null, "ik": null, "auts": "<28 hex>"}
@@ -47,6 +49,7 @@ from urllib.parse import parse_qs, urlparse
 from smartcard.System import readers
 
 USIM_AID_PREFIX = bytes.fromhex("A0000000871002")
+ISIM_AID_PREFIX = bytes.fromhex("A0000000871004")
 
 DEFAULT_UNIX_SOCKET = "/run/nekoims/simcard.sock"
 
@@ -137,14 +140,21 @@ class Usim:
             raise CardError(f"implausible IMSI {digits!r}")
         return digits
 
-    def authenticate(self, rand: bytes, autn: bytes) -> dict:
-        """UMTS AKA (AUTHENTICATE, 3G context). Returns hex RES/CK/IK or AUTS."""
+    def authenticate(self, rand: bytes, autn: bytes,
+                     isim: bool = False) -> dict:
+        """UMTS AKA (AUTHENTICATE, 3G context), on the ISIM if asked and
+        present. Returns hex RES/CK/IK or AUTS."""
         body = bytes([len(rand)]) + rand + bytes([len(autn)]) + autn
         apdu = bytes([0x00, 0x88, 0x00, 0x81, len(body)]) + body + b"\x00"
         with self.lock:
             conn = self._connect()
             try:
-                self._select_usim(conn)
+                try:
+                    if not isim:
+                        raise CardError("USIM asked for")
+                    self._select_app(conn, ISIM_AID_PREFIX, "ISIM")
+                except CardError:
+                    self._select_usim(conn)
                 data, sw1, sw2 = self._xmit(conn, apdu)
             finally:
                 conn.disconnect()
@@ -216,7 +226,8 @@ class Handler(BaseHTTPRequestHandler):
             elif kind == "rand-autn":
                 rand = parse_hex(q, "rand", 16)
                 autn = parse_hex(q, "autn", 16)
-                self._reply(200, self.usim.authenticate(rand, autn))
+                isim = q.get("app", [""])[0] == "isim"
+                self._reply(200, self.usim.authenticate(rand, autn, isim))
             elif kind == "apdu":
                 self._reply(200, self.usim.apdu(parse_hex(q, "hex")))
             else:

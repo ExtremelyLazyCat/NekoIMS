@@ -79,6 +79,7 @@ struct ImsRegistration::AkaJob {
     SimcardClient sim;
     Challenge ch;
     std::vector<uint8_t> rand, autn;
+    std::string app;
     AkaResult result;
 
     AkaJob(ImsRegistration* s, const SimcardClient& c) : self(s), sim(c) {}
@@ -89,6 +90,8 @@ ImsRegistration::ImsRegistration(struct sip* sip, const ImsRegConfig& cfg,
     : sip_(sip), cfg_(cfg), sim_(sim), expires_(cfg.expires) {
     tmr_init(&tmr_);
     tmr_init(&stop_tmr_);
+    sa_init(&local_, AF_UNSPEC);
+    sa_init(&server_addr_, AF_UNSPEC);
 }
 
 ImsRegistration::~ImsRegistration() {
@@ -96,21 +99,65 @@ ImsRegistration::~ImsRegistration() {
     tmr_cancel(&stop_tmr_);
     if (job_) job_->self = nullptr;  // freed by aka_done
     mem_deref(req_);
-    mem_deref(dlg_);
 }
 
+// Our own Call-ID, From tag and CSeq rather than a libre dialog: a dialog's
+// route is fixed, and sec-agree moves REGISTER to the P-CSCF's protected port
+// mid-registration with the same Call-ID (TS 24.229 5.1.1.5.1).
 int ImsRegistration::start() {
-    const std::string uri = "sip:" + cfg_.domain;
-    const char* routev[1] = {cfg_.outbound.c_str()};
+    new_dialog();
+    set_route(cfg_.outbound);
 
-    int err = sip_dialog_alloc(&dlg_, uri.c_str(), cfg_.impu.c_str(), NULL,
-                               cfg_.impu.c_str(), routev, 1);
-    if (err) return err;
+    if (cfg_.sec_agree) {
+        IpsecSet::flush_stale();
+        new_spis();
+    }
 
     info("ims: registering %s (impi %s) via %s\n", cfg_.impu.c_str(),
          cfg_.impi.c_str(), cfg_.outbound.c_str());
 
     return send_register(empty_authorization());
+}
+
+// A fresh Call-ID and From tag, at start and after a failed registration:
+// the P-CSCF keeps sec-agree state per Call-ID and answers a retry on the
+// old one with a bogus Security-Server (spi-s=0).
+void ImsRegistration::new_dialog() {
+    char buf[40];
+    re_snprintf(buf, sizeof(buf), "%016llx%08x", (unsigned long long)rand_u64(),
+                rand_u32());
+    call_id_ = buf;
+    re_snprintf(buf, sizeof(buf), "%016llx", (unsigned long long)rand_u64());
+    from_tag_ = buf;
+    cseq_ = rand_u16();
+}
+
+void ImsRegistration::new_spis() {
+    do spi_c_ = rand_u32(); while (spi_c_ < 0x100);
+    do spi_s_ = rand_u32(); while (spi_s_ < 0x100 || spi_s_ == spi_c_);
+}
+
+void ImsRegistration::set_route(const std::string& route) {
+    const bool changed = route != route_;
+    route_ = route;
+    struct pl pl;
+    pl_set_str(&pl, route_.c_str());
+    if (uri_decode(&route_uri_, &pl))
+        warning("ims: bad route %s\n", route_.c_str());
+    if (changed && cfg_.on_route_change) cfg_.on_route_change();
+}
+
+void ImsRegistration::drop_ipsec() {
+    const bool had = active_ != nullptr;
+    pending_.reset();
+    active_.reset();
+    active_verify_.clear();
+    security_verify_.clear();
+    have_server_ = false;
+    if (route_ != cfg_.outbound)
+        set_route(cfg_.outbound);
+    else if (had && cfg_.on_route_change)
+        cfg_.on_route_change();
 }
 
 void ImsRegistration::stop(DoneHandler done, void* arg) {
@@ -124,7 +171,7 @@ void ImsRegistration::stop(DoneHandler done, void* arg) {
         job_ = nullptr;
     }
 
-    if (!registered_ || !dlg_) {
+    if (!registered_) {
         finish_stop();
         return;
     }
@@ -140,6 +187,7 @@ void ImsRegistration::finish_stop() {
     tmr_cancel(&stop_tmr_);
     req_ = static_cast<struct sip_request*>(mem_deref(req_));
     registered_ = false;
+    drop_ipsec();
 
     DoneHandler done = done_;
     done_ = nullptr;
@@ -164,17 +212,37 @@ int ImsRegistration::send_register(const std::string& authorization) {
     std::string hdrs = authorization;
     for (size_t i = 0; i < cfg_.headers.size(); ++i)
         hdrs += cfg_.headers[i].first + ": " + cfg_.headers[i].second + "\r\n";
+    if (cfg_.sec_agree) {
+        hdrs += "Supported: sec-agree\r\n"
+                "Require: sec-agree\r\n"
+                "Proxy-Require: sec-agree\r\n"
+                "Security-Client: " +
+                security_client(spi_c_, spi_s_, cfg_.sec_port) + "\r\n";
+        if (!security_verify_.empty())
+            hdrs += "Security-Verify: " + security_verify_ + "\r\n";
+    }
+    if (!cfg_.user_agent.empty())
+        hdrs += "User-Agent: " + cfg_.user_agent + "\r\n";
 
     req_ = static_cast<struct sip_request*>(mem_deref(req_));
 
-    return sip_drequestf(&req_, sip_, true, "REGISTER", dlg_, 0, NULL,
-                         send_handler, response_handler, this,
-                         "%s"
-                         "Supported: path\r\n"
-                         "Expires: %u\r\n"
-                         "Content-Length: 0\r\n"
-                         "\r\n",
-                         hdrs.c_str(), expires_);
+    const std::string uri = "sip:" + cfg_.domain;
+    return sip_requestf(&req_, sip_, true, "REGISTER", uri.c_str(),
+                        &route_uri_, NULL, send_handler, response_handler,
+                        this,
+                        "Route: <%s;lr>\r\n"
+                        "To: <%s>\r\n"
+                        "From: <%s>;tag=%s\r\n"
+                        "Call-ID: %s\r\n"
+                        "CSeq: %u REGISTER\r\n"
+                        "%s"
+                        "Supported: path\r\n"
+                        "Expires: %u\r\n"
+                        "Content-Length: 0\r\n"
+                        "\r\n",
+                        route_.c_str(), cfg_.impu.c_str(), cfg_.impu.c_str(),
+                        from_tag_.c_str(), call_id_.c_str(), ++cseq_,
+                        hdrs.c_str(), expires_);
 }
 
 int ImsRegistration::send_handler(enum sip_transp tp, struct sa* src,
@@ -184,6 +252,7 @@ int ImsRegistration::send_handler(enum sip_transp tp, struct sa* src,
     (void)dst;
     (void)contp;
 
+    self->local_ = *src;
     return mbuf_printf(mb, "Contact: <sip:%s@%J%s>%s\r\n",
                        self->cfg_.contact_user.c_str(), src,
                        sip_transp_param(tp), self->cfg_.contact_params.c_str());
@@ -196,8 +265,11 @@ void ImsRegistration::response_handler(int err, const struct sip_msg* msg,
 
 void ImsRegistration::on_response(int err, const struct sip_msg* msg) {
     if (err || !msg) {
-        fail(err ? "transport error" : "no response");
         if (err) warning("ims: REGISTER failed: %m\n", err);
+        if (pending_ || active_)
+            warning("ims: ipsec counters:\n%s",
+                    (pending_ ? pending_ : active_)->stats().c_str());
+        fail(err ? "transport error" : "no response");
         return;
     }
 
@@ -222,6 +294,7 @@ void ImsRegistration::on_response(int err, const struct sip_msg* msg) {
         if (minexp && pl_u32(&minexp->val) && expires_) {
             expires_ = pl_u32(&minexp->val);
             sent_credentials_ = false;
+            if (cfg_.sec_agree) new_spis();
             if (!send_register(empty_authorization())) return;
         }
     }
@@ -241,15 +314,33 @@ void ImsRegistration::on_ok(const struct sip_msg* msg) {
         return;
     }
 
+    if (pending_) {
+        // The new SAs carried this registration: retire the old ones.
+        if (active_) active_->forget_shared(*pending_);
+        active_ = std::move(pending_);
+        active_verify_ = security_verify_;
+        if (cfg_.on_route_change) cfg_.on_route_change();
+    }
+
+    const std::string old_identity = preferred_identity();
     service_route_.clear();
+    associated_.clear();
     struct le* le;
     for (le = list_head(&msg->hdrl); le; le = le->next) {
         const struct sip_hdr* hdr =
             static_cast<const struct sip_hdr*>(le->data);
-        if (hdr->id == SIP_HDR_SERVICE_ROUTE)
+        if (hdr->id == SIP_HDR_SERVICE_ROUTE) {
             service_route_.push_back(pl_str(hdr->val));
-        else if (!pl_strcasecmp(&hdr->name, "P-Associated-URI"))
+        } else if (!pl_strcasecmp(&hdr->name, "P-Associated-URI")) {
             info("ims: P-Associated-URI: %r\n", &hdr->val);
+            struct sip_addr addr;
+            if (!sip_addr_decode(&addr, &hdr->val))
+                associated_.push_back(pl_str(addr.auri));
+        }
+    }
+    if (preferred_identity() != old_identity) {
+        info("ims: asserting %s\n", preferred_identity().c_str());
+        if (cfg_.on_identity_change) cfg_.on_identity_change();
     }
 
     const uint32_t granted = granted_expires(msg);
@@ -263,6 +354,14 @@ void ImsRegistration::on_ok(const struct sip_msg* msg) {
     uint32_t refresh = granted / 2;
     if (refresh < kMinRefresh) refresh = kMinRefresh;
     tmr_start(&tmr_, refresh * 1000ULL, timer_handler, this);
+}
+
+std::string ImsRegistration::preferred_identity() const {
+    for (size_t i = 0; i < associated_.size(); ++i)
+        if (associated_[i].compare(0, 5, "sip:+") == 0) return associated_[i];
+    for (size_t i = 0; i < associated_.size(); ++i)
+        if (associated_[i].compare(0, 4, "tel:") == 0) return associated_[i];
+    return associated_.empty() ? cfg_.impu : associated_[0];
 }
 
 // Expiry granted for our binding: Contact expires= wins over Expires.
@@ -289,6 +388,30 @@ uint32_t ImsRegistration::granted_expires(const struct sip_msg* msg) const {
 void ImsRegistration::on_challenge(const struct sip_msg* msg) {
     const struct sip_hdr* hdr = sip_msg_hdr(msg, SIP_HDR_WWW_AUTHENTICATE);
     struct httpauth_digest_chall hc;
+
+    if (cfg_.sec_agree) {
+        security_verify_.clear();
+        struct le* le;
+        for (le = list_head(&msg->hdrl); le; le = le->next) {
+            const struct sip_hdr* h =
+                static_cast<const struct sip_hdr*>(le->data);
+            if (h->id != SIP_HDR_SECURITY_SERVER) continue;
+            if (!security_verify_.empty()) security_verify_ += ", ";
+            security_verify_ += pl_str(h->val);
+        }
+        have_server_ =
+            pick_security(parse_security(security_verify_), server_);
+        server_addr_ = msg->src;
+        if (security_verify_.empty())
+            warning("ims: sec-agree: 401 has no Security-Server\n");
+        else if (!have_server_)
+            warning("ims: sec-agree: nothing usable in Security-Server: %s\n",
+                    security_verify_.c_str());
+        else
+            info("ims: sec-agree: %s/%s, P-CSCF port-c %u port-s %u\n",
+                 server_.alg.c_str(), server_.ealg.c_str(), server_.port_c,
+                 server_.port_s);
+    }
 
     if (!hdr || httpauth_digest_challenge_decode(&hc, &hdr->val)) {
         fail("401 without a usable WWW-Authenticate");
@@ -322,6 +445,7 @@ void ImsRegistration::on_challenge(const struct sip_msg* msg) {
     job->ch = ch;
     job->rand.assign(raw, raw + 16);
     job->autn.assign(raw + 16, raw + 32);
+    job->app = cfg_.aka_app;
 
     if (job_) job_->self = nullptr;
     job_ = job;
@@ -337,7 +461,7 @@ void ImsRegistration::on_challenge(const struct sip_msg* msg) {
 
 int ImsRegistration::aka_work(void* arg) {
     AkaJob* job = static_cast<AkaJob*>(arg);
-    job->result = job->sim.authenticate(job->rand, job->autn);
+    job->result = job->sim.authenticate(job->rand, job->autn, job->app);
     return 0;
 }
 
@@ -422,6 +546,33 @@ void ImsRegistration::on_aka(AkaJob* job) {
     // A resync isn't a credential failure; the next 401 carries a new vector.
     sent_credentials_ = !r.sync_failure;
 
+    // TS 33.203 7.2: the SAs go up before the REGISTER that answers the
+    // challenge, which then goes to the P-CSCF's protected server port.
+    if (cfg_.sec_agree && r.ok && !r.sync_failure) {
+        if (!have_server_) {
+            fail("no usable Security-Server");
+            return;
+        }
+        char lip[64], rip[64];
+        re_snprintf(lip, sizeof(lip), "%j", &local_);
+        re_snprintf(rip, sizeof(rip), "%j", &server_addr_);
+        std::string why;
+        pending_.reset(new IpsecSet);
+        if (!pending_->install(lip, rip, cfg_.sec_port, spi_c_,
+                               spi_s_, server_, r.ck, r.ik, why)) {
+            pending_.reset();
+            warning("ims: ipsec: %s\n", why.c_str());
+            fail("ipsec");
+            return;
+        }
+        struct sa ps = server_addr_;
+        sa_set_port(&ps, server_.port_s);
+        char route[128];
+        re_snprintf(route, sizeof(route), "sip:%J;transport=%s", &ps,
+                    cfg_.sec_proto.c_str());
+        set_route(route);
+    }
+
     err = send_register(auth);
     if (err) {
         warning("ims: sending REGISTER failed: %m\n", err);
@@ -433,6 +584,8 @@ void ImsRegistration::fail(const char* why) {
     registered_ = false;
     sent_credentials_ = false;
     auth_failures_ = 0;
+    drop_ipsec();
+    new_dialog();
 
     if (stopping_) {
         finish_stop();
@@ -450,6 +603,9 @@ void ImsRegistration::fail(const char* why) {
 void ImsRegistration::timer_handler(void* arg) {
     ImsRegistration* self = static_cast<ImsRegistration*>(arg);
     self->expires_ = self->cfg_.expires;
+    // A re-REGISTER goes over the current SAs with fresh SPIs for the next
+    // set (TS 33.203 7.4); after a failure it starts from scratch.
+    if (self->cfg_.sec_agree) self->new_spis();
 
     int err = self->send_register(self->empty_authorization());
     if (err) {

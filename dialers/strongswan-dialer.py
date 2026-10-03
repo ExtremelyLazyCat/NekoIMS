@@ -503,16 +503,24 @@ def use_remote(url: str, pinned: str | None) -> str:
 # -- vici --------------------------------------------------------------------
 
 def load_cas(session, paths: list[str]) -> int:
-    """Trust anchors for the ePDG certificate, loaded over vici."""
-    n = 0
+    """Trust anchors for the ePDG certificate, loaded over vici. Ones charon
+    can't parse (e.g. ECDSA roots on a build without an EC plugin) are
+    skipped rather than failing the whole dial."""
+    from vici.exception import CommandException
+    n = skipped = 0
     for path in paths:
         with open(path) as f:
             pem = f.read()
         for b64 in re.findall(r"-----BEGIN CERTIFICATE-----(.*?)"
                               r"-----END CERTIFICATE-----", pem, re.S):
-            session.load_cert({"type": "x509", "flag": "CA",
-                               "data": base64.b64decode(b64)})
-            n += 1
+            try:
+                session.load_cert({"type": "x509", "flag": "CA",
+                                   "data": base64.b64decode(b64)})
+                n += 1
+            except CommandException:
+                skipped += 1
+    if skipped:
+        log(f"skipped {skipped} CA certificates charon could not parse")
     return n
 
 
@@ -565,14 +573,22 @@ def connection(epdg: str, identity: str, remote_id: str, remote_auth: str,
 
 
 P_CSCF_RE = re.compile(r"received P-CSCF server IP (\S+)")
+# The ePDG authenticated itself with the EAP MSK (RFC 5998) while we wanted
+# a certificate.
+EAP_ONLY_RE = re.compile(r"constraint requires public key authentication, "
+                         r"but EAP was used")
 
 
-def initiate(session) -> list[str]:
-    """Bring the tunnel up; returns the P-CSCFs charon logged on the way."""
+def initiate(session, logs: list[str] | None = None) -> list[str]:
+    """Bring the tunnel up; returns the P-CSCFs charon logged on the way.
+    The log lines go to logs too, for a look after a failure."""
     pcscfs = []
     for msg in session.initiate({"child": CHILD, "ike": CONN,
                                  "timeout": "30000", "loglevel": "1"}):
-        m = P_CSCF_RE.search(s(msg.get("msg", b"")))
+        line = s(msg.get("msg", b""))
+        if logs is not None:
+            logs.append(line)
+        m = P_CSCF_RE.search(line)
         if m and m.group(1) not in pcscfs:
             pcscfs.append(m.group(1))
     return pcscfs
@@ -628,7 +644,8 @@ def main():
                          "always encapsulating it in UDP 4500")
     ap.add_argument("--remote-auth", choices=("pubkey", "eap"), default=None,
                     help="how the ePDG authenticates (default: bundle "
-                         "epdg_auth, else pubkey)")
+                         "epdg_auth, else pubkey with a fallback to eap if "
+                         "the ePDG turns out to be EAP-only)")
     ap.add_argument("--ca", action="append", default=None,
                     help=f"CA bundle(s) for the ePDG certificate "
                          f"(default: {CA_BUNDLE_DEFAULT})")
@@ -724,22 +741,38 @@ def main():
         charon.start()
 
         cmd = charon.session()
-        remote_auth = args.remote_auth or bundle.get("epdg_auth", "pubkey")
+        remote_auth = args.remote_auth or bundle.get("epdg_auth")
+        # Nobody said how the ePDG authenticates: want a certificate, but
+        # fall back to EAP-only if that is what it does (e.g. AT&T).
+        auth_guessed = remote_auth is None
+        remote_auth = remote_auth or "pubkey"
         if remote_auth == "pubkey":
             n = load_cas(cmd, args.ca or [CA_BUNDLE_DEFAULT])
             log(f"loaded {n} CA certificates")
-        cmd.load_conn(connection(epdg, identity, args.remote_id or apn,
-                                 remote_auth, bundle,
-                                 encap=not args.no_encap,
-                                 family=args.epdg_family))
+
+        def load_conn():
+            cmd.load_conn(connection(epdg, identity, args.remote_id or apn,
+                                     remote_auth, bundle,
+                                     encap=not args.no_encap,
+                                     family=args.epdg_family))
+        load_conn()
 
         events = charon.session()
         while True:
+            logs = []
             try:
-                pcscfs = initiate(cmd)
+                pcscfs = initiate(cmd, logs)
             except Exception as e:  # vici.exception.CommandException
                 log(f"initiate failed: {e}")
                 charon.check()
+                if auth_guessed and remote_auth == "pubkey" and \
+                        any(EAP_ONLY_RE.search(line) for line in logs):
+                    log("the ePDG authenticates with EAP only (RFC 5998), "
+                        "redialing that way; set \"epdg_auth\": \"eap\" in "
+                        "its carrier bundle (or pass --remote-auth eap)")
+                    remote_auth = "eap"
+                    load_conn()
+                    continue
                 if not args.retry:
                     sys.exit(1)
                 time.sleep(args.retry)

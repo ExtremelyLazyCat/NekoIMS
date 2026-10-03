@@ -1,0 +1,35 @@
+{
+  "name": "AT&T Mobility",
+  "mccmnc": "310280",
+  "domain": "one.att.net",
+  "impi_domain": "private.att.net",
+  "identity": "isim",
+  "aka_app": "isim",
+  "epdg": "epdg.epc.mnc280.mcc310.pub.3gppnetwork.org",
+  "apn": "ims",
+  "epdg_auth": "eap",
+  "transport": "udp",
+  "sec_agree": true,
+  "p_access_network_info": "IEEE-802.11;i-wlan-node-id=000000000000;country=US",
+  "audio_codecs": "PCMU",
+  "sms": {
+    "format": "3gpp",
+    "smsc": "sip:one.att.net"
+  },
+  "notes": [
+    "Tested with a 310280 eSIM in a Samsung phone, read over its USB AT port (simcard-server/serial_server.py). AT&T has other MCC/MNCs (310410 and more); this bundle only covers IMSIs starting 310280.",
+    "The ePDG authenticates with EAP only (RFC 5998), no certificate. The 3GPP discovery name above works; AT&T's iOS bundle uses epdg.epc.att.net, which resolves too (epdg.epc.att-idns.net). It assigns an IPv6 address and IPv6 P-CSCFs over the tunnel.",
+    "Identities come from the ISIM, not the USIM: IMPI <IMSI>@private.att.net, IMPU sip:<IMSI>@one.att.net, home domain one.att.net (the iOS bundle has USIMFallbackSupport false). IMS AKA (AKAv1-MD5) must run on the ISIM: on the USIM the challenge fails with a MAC failure. Guessed 3GPP identities get 'User not existed in HSS'.",
+    "The ISIM IMPU is barred for calls; the 200 OK to REGISTER lists tel:+1NPANXXXXXX and sip:+1NPANXXXXXX@one.att.net in P-Associated-URI. NekoIMS asserts the sip:+ one and uses the MSISDN for From/Contact, so msisdn must be set (the ISIM doesn't carry it; mkconfig asks).",
+    "The P-CSCF requires sec-agree with ipsec-3gpp (421 Extension Required without it) and only answers the authenticated REGISTER over the IPsec SAs, at its port-s (6000). It picks hmac-md5-96 or hmac-sha-1-96 with aes-cbc; both work. NekoIMS offers one port (5060) as both port-c and port-s, which AT&T accepts; it then sends everything to us on the SA for our spi-s, from either of its ports.",
+    "The SAs are nested inside the SWu tunnel: their inbound policies are mirrored into the XFRM interface's link netns with its if_id (src/ipsec.cpp), or the kernel drops the decrypted replies there (XfrmInTmplMismatch).",
+    "Outgoing calls without P-Access-Network-Info get an announcement ('VM00006 Your call cannot be completed at this time', X-ATT-Service ann_id=1124 in the 183). With it they ring and connect; plain sip:+1...@one.att.net request URIs work, no user=phone needed.",
+    "A REGISTER that times out leaves state behind: new registrations from the same tunnel address get 480 ('New Register Arrives for an On-going Register', later without a Warning) for well over ten minutes. Redialing the tunnel (new address) clears it; a clean deregistration avoids it.",
+    "SMS is plain 3GPP (application/vnd.3gpp.sms, TS 24.341) in both directions, over the SAs. Incoming SMS arrive as MESSAGE from sip:one.att.net (P-Asserted-Identity sip:cnc03cpm.mobile.att.net), RP SMSC address +19703769769; the SMS-layer ack and sent SMS go to sip:one.att.net (sms.smsc) and get 202 Accepted, delivery reports come back the same way.",
+    "The network grants about 2100-2400 s whatever Expires asks for.",
+    "Incoming INVITEs are too big for UDP and come over TCP (RFC 3261 18.1.1), from the P-CSCF's port-c to our 5060, over the same SAs: without TCP in the SAs' policies they never arrive and callers go straight to voicemail. Our responses to the INVITE (180, 183, 200) must carry P-Access-Network-Info, or the network CANCELs right after the 180 with Reason cause=480 \"Invalid Location\" (iOS: AddLocationInInviteResponses 180,183). baresip needs patches/baresip/0002 for that.",
+    "Incoming offers restrict AMR-WB to mode-set=2 (12.65 kbit/s; 101 has mode-set=0,1,2) and AMR to mode-set=7, and list PCMU (0) but not PCMA. baresip's AMR encoder ignores mode-set and always sends AMR-WB mode 8, which AT&T drops (the caller hears nothing; baresip answers in the offer's codec order, so reordering doesn't help). AMR alone (102, mode-set=7, matching baresip's MR122) negotiates and RTP keeps flowing both ways at 12.8 kbit/s, but audio stops in both directions after ~8 s, with no SIP event: the network's media path apparently rejects baresip's AMR payload; PCMU works both ways, so audio_codecs is PCMU only. Outgoing calls get answers without mode-set, where AMR-WB mode 8 worked, but are PCMU too with this setting.",
+    "Incoming calls do not work. No invite recieved. Not an ipsec issue, since SMS works incoming",
+    "Not tested yet: re-registration over the SAs."
+  ]
+}

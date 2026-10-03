@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import glob
+import http.client
 import importlib.util
 import json
 import os
@@ -50,7 +51,8 @@ SIMCARD_SERVER_DEFAULT = "unix:/run/nekoims/simcard.sock"
 
 # Bundle keys copied into nekoims.json as-is.
 CONFIG_KEYS = ("domain", "transport", "pcscf_port", "p_access_network_info",
-               "contact_features", "expires", "user_agent", "sms")
+               "contact_features", "expires", "user_agent", "sms",
+               "sec_agree", "aka_app", "audio_codecs")
 
 # MCCs in the North American Numbering Plan (+1). They use 3-digit MNCs.
 NANP_MCCS = {"302"} | {str(m) for m in range(310, 317)}
@@ -59,6 +61,9 @@ ISIM_AID_PREFIX = bytes.fromhex("A0000000871004")
 
 MSISDN_PROMPT = ("NekoIMS could not determine your phone number\r\n"
                  "Please enter it (ex: +18008675309): ")
+IMEI_PROMPT = ("NekoIMS could not determine your IMEI\r\n"
+               "Please enter the 15-digit IMEI of the device the SIM is in "
+               "(dial *#06#): ")
 
 
 def log(msg: str):
@@ -278,6 +283,60 @@ def impu_number(impus: list[str]) -> str | None:
     return None
 
 
+# -- running SIM server --------------------------------------------------------
+
+def server_identity(where: str) -> dict:
+    """The IMSI from a SIM server that is already running (e.g.
+    serial_server.py), plus the IMEI and ISIM identities where it offers
+    them; its APDU passthrough can't hold an EF selection across requests."""
+    class UnixConn(http.client.HTTPConnection):
+        def connect(self):
+            self.sock = socket.socket(socket.AF_UNIX)
+            self.sock.settimeout(10)
+            self.sock.connect(where[len("unix:"):])
+
+    def get(kind: str) -> tuple[int, dict]:
+        if where.startswith("unix:"):
+            conn = UnixConn("sim")
+        else:
+            conn = http.client.HTTPConnection(
+                re.sub(r"^https?://", "", where).rstrip("/"), timeout=10)
+        try:
+            conn.request("GET", f"/?type={kind}")
+            resp = conn.getresponse()
+            return resp.status, json.loads(resp.read() or b"{}")
+        finally:
+            conn.close()
+
+    try:
+        status, body = get("imsi")
+    except (OSError, ValueError) as e:
+        sys.exit(f"cannot reach the SIM server on {where}: {e}")
+    imsi = body.get("imsi")
+    if status != 200 or not imsi or not str(imsi).isdigit():
+        sys.exit(f"SIM server on {where}: {body.get('error', status)}")
+    ident = {"where": f"SIM server {where}", "imsi": imsi, "mnc": None,
+             "imei": None, "numbers": []}
+
+    # Extensions of serial_server.py; the other servers answer 400.
+    for kind in ("imei", "isim"):
+        try:
+            status, body = get(kind)
+        except (OSError, ValueError):
+            continue
+        if status != 200:
+            if kind == "isim" and status != 400:
+                log(f"warning: ISIM not readable: {body.get('error', status)}")
+            continue
+        if kind == "imei":
+            ident["imei"] = body.get("imei")
+        else:
+            ident["impi"] = body.get("impi")
+            ident["home_domain"] = body.get("domain")
+            ident["impus"] = body.get("impu") or []
+    return ident
+
+
 # -- carrier -----------------------------------------------------------------
 
 def find_bundle(imsi: str, bundles_dir: str):
@@ -367,6 +426,34 @@ def ask_msisdn(mcc: str) -> str | None:
             "(ex: +18008675309)")
 
 
+def imei_ok(imei: str) -> bool:
+    """15 digits with a valid Luhn check digit (TS 23.003 6.2.1)."""
+    if not re.fullmatch(r"\d{15}", imei):
+        return False
+    total = 0
+    for i, c in enumerate(reversed(imei)):
+        d = int(c) * (2 if i % 2 else 1)
+        total += d - 9 if d > 9 else d
+    return total % 10 == 0
+
+
+def ask_imei() -> str | None:
+    if not sys.stdin.isatty():
+        return None
+    while True:
+        try:
+            with contextlib.redirect_stdout(sys.stderr):
+                answer = re.sub(r"[\s/-]", "", input(IMEI_PROMPT))
+        except EOFError:
+            return None
+        if not answer:
+            return None
+        if imei_ok(answer):
+            return answer
+        log(f"'{answer}' is not a valid IMEI (15 digits, last one the "
+            "check digit)")
+
+
 def have_pcsc_card() -> bool:
     try:
         from smartcard.System import readers
@@ -385,9 +472,12 @@ def have_pcsc_card() -> bool:
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
-    ap.add_argument("--sim", choices=("auto", "pcsc", "mm"), default="auto",
+    ap.add_argument("--sim", choices=("auto", "pcsc", "mm", "server"),
+                    default="auto",
                     help="where the SIM is (default: --reader/--modem if "
-                         "given, else a PC/SC card, else ModemManager)")
+                         "given, else a PC/SC card, else ModemManager); "
+                         "server asks the running --simcard-server for the "
+                         "IMSI only")
     ap.add_argument("--reader", type=int, default=None,
                     help="PC/SC reader index (default: 0)")
     ap.add_argument("--modem", default=None,
@@ -424,7 +514,9 @@ def main():
             sim = "mm"
         else:
             sim = "pcsc" if have_pcsc_card() else "mm"
-    if sim == "pcsc":
+    if sim == "server":
+        ident = server_identity(args.simcard_server)
+    elif sim == "pcsc":
         ident = pcsc_identity(args.reader or 0)
     else:
         ident = mm_identity(args.modem)
@@ -435,6 +527,9 @@ def main():
 
     bundle, source = find_bundle(imsi, args.bundles_dir)
     standard = bundle is None
+    mccmnc = str((bundle or {}).get("mccmnc", ""))
+    if not mnc and mccmnc.startswith(mcc) and imsi.startswith(mccmnc):
+        mnc = mccmnc[3:]
     if standard:
         bundle, mnc = standard_carrier(imsi, mnc)
         source = "standard carrier mode"
@@ -457,33 +552,55 @@ def main():
     if not msisdn:
         msisdn = ask_msisdn(mcc)
     if not msisdn:
-        log("warning: no MSISDN; NekoIMS will register with an IMSI-based "
-            "IMPU, which most operators reject")
+        log("warning: no MSISDN; calls go out as the registered IMPU, which "
+            "operators usually bar when it is IMSI-based")
 
-    impi = f"{imsi}@{domain}"
+    # Bundle "identity": "isim" (an operator that provisions the ISIM with
+    # its own IMPI/IMPU, e.g. AT&T): those, else IMSI@impi_domain and
+    # sip:IMSI@domain, which is what such ISIMs hold. "usim": never the
+    # ISIM's, always IMSI@domain and the MSISDN (e.g. Verizon).
+    use_isim = standard or bundle.get("identity") == "isim"
+    impi = f"{imsi}@{bundle.get('impi_domain', domain)}"
     isim_impi = ident.get("impi")
-    if isim_impi and (standard or isim_impi.endswith("@" + domain)):
+    if isim_impi and bundle.get("identity") != "usim" and (
+            use_isim or isim_impi.endswith("@" + domain)):
         impi = isim_impi
+    elif bundle.get("identity") == "isim":
+        log(f"warning: ISIM not readable, assuming IMPI {impi}")
 
     cfg = {"domain": domain}
     if msisdn:
         cfg["msisdn"] = msisdn
     cfg["impi"] = impi
+    # Register the ISIM's first SIP IMPU (TS 24.229 5.1.1.1A), as a handset
+    # would, unless a bundle says how the operator wants it. Calls still go
+    # out as the MSISDN (NekoIMS asserts what P-Associated-URI offers).
+    sip_impus = [u for u in ident.get("impus") or []
+                 if u.lower().startswith("sip:")]
+    if use_isim and sip_impus:
+        cfg["impu"] = sip_impus[0]
+    elif bundle.get("identity") == "isim":
+        cfg["impu"] = f"sip:{imsi}@{domain}"
     if args.pcscf:
         cfg["pcscf"] = args.pcscf
     for key in CONFIG_KEYS:
         if key in bundle and key not in cfg:
             cfg[key] = bundle[key]
     cfg["simcard_server"] = args.simcard_server
+    if args.imei and not imei_ok(args.imei):
+        sys.exit(f"--imei '{args.imei}' is not a valid 15-digit IMEI")
     imei = args.imei or ident["imei"]
-    if imei and imei.isdigit() and len(imei) == 15:
+    if imei and not imei_ok(imei):
+        log(f"warning: IMEI '{imei}' from the {ident['where']} is not a valid "
+            "15-digit IMEI, ignoring it")
+        imei = None
+    if not imei:
+        imei = ask_imei()
+    if imei:
         cfg["imei"] = imei
-    elif imei:
-        log(f"warning: IMEI '{imei}' is not 15 digits, registering without "
-            "+sip.instance")
     else:
-        log("warning: no IMEI (pass --imei), registering without "
-            "+sip.instance")
+        log("warning: no IMEI (pass --imei); registering without "
+            "+sip.instance, which most operators reject")
 
     text = json.dumps(cfg, indent=2) + "\n"
     if args.output:
@@ -508,6 +625,9 @@ def main():
     if ident.get("spn"):
         name += f", SIM says \"{ident['spn']}\""
     log(f"{ident['where']}, IMSI {imsi}, carrier: {name} [{source}]")
+    if ident.get("impi") or ident.get("impus"):
+        log(f"ISIM: impi={ident.get('impi')} domain={ident.get('home_domain')}"
+            f" impu={', '.join(ident.get('impus') or [])}")
     if not args.pcscf:
         log("start nekoims with -p <pcscf> (from the ePDG dialer)")
     if bundle.get("epdg"):

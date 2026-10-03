@@ -7,7 +7,10 @@
 #
 #   ./start.sh [options] [-- nekoims args...]
 #
-#   --sim pcsc|mm     SIM backend (default: autodetect, PC/SC reader first)
+#   --sim pcsc|mm|server
+#                     SIM backend (default: autodetect, PC/SC reader first,
+#                     else a SIM server already on the socket, e.g. a
+#                     serial_server.py started by hand)
 #   --reader N        PC/SC reader index (pcsc)
 #   --modem M         ModemManager modem index, path or IMEI (mm)
 #   --config PATH     NekoIMS config (default: generated from the SIM by
@@ -16,6 +19,9 @@
 #                     to x86_64/arm64 (default: latest neko-strongswan release)
 #   --charon PATH     use an installed charon instead of --remote
 #   --rebuild         rebuild NekoIMS even if build/nekoims exists
+#   --watch           restart NekoIMS (keeping the tunnel) whenever
+#                     build/nekoims changes, and copy its and the dialer's
+#                     output to build/ (readable without root)
 #
 # Everything after -- goes to nekoims (e.g. -- -v -t). Ctrl-C or quitting
 # NekoIMS hangs up the tunnel and stops what this script started.
@@ -30,7 +36,7 @@ NETNS=ims
 REMOTE_DEFAULT='https://github.com/MercuryWorkshop/neko-strongswan/releases/latest/download/linux-strongswan-{arch}.tar.gz'
 DIAL_TIMEOUT=90
 
-SIM=auto READER= MODEM= CONFIG= REMOTE= CHARON= REBUILD=0
+SIM=auto READER= MODEM= CONFIG= REMOTE= CHARON= REBUILD=0 WATCH=0
 NEKOIMS_ARGS=()
 SUDO_ARGS=()  # our arguments minus --rebuild, for the re-run under sudo
 for a in "$@"; do [ "$a" = --rebuild ] || SUDO_ARGS+=("$a"); done
@@ -47,13 +53,14 @@ while [ $# -gt 0 ]; do
 		--remote)	REMOTE=${2:?}; shift ;;
 		--charon)	CHARON=${2:?}; shift ;;
 		--rebuild)	REBUILD=1 ;;
+		--watch)	WATCH=1 ;;
 		--)			shift; NEKOIMS_ARGS=("$@"); break ;;
-		-h|--help)	sed -n '4,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		-h|--help)	sed -n '4,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
 		*)			die "unknown option $1 (see --help)" ;;
 	esac
 	shift
 done
-case $SIM in auto|pcsc|mm) ;; *) die "--sim must be pcsc or mm" ;; esac
+case $SIM in auto|pcsc|mm|server) ;; *) die "--sim must be pcsc, mm or server" ;; esac
 [ -n "$REMOTE" ] && [ -n "$CHARON" ] && die "--remote and --charon are exclusive"
 
 # -- 1. build (as the invoking user, never as root) ---------------------------
@@ -79,9 +86,10 @@ fi
 
 # -- cleanup ------------------------------------------------------------------
 
-SIM_PID= DIAL_PID=
+SIM_PID= DIAL_PID= TAIL_PID=
 cleanup() {
 	trap - EXIT INT TERM
+	[ -z "$TAIL_PID" ] || kill "$TAIL_PID" 2>/dev/null || true
 	if [ -n "$DIAL_PID" ] && kill -0 "$DIAL_PID" 2>/dev/null; then
 		log "hanging up the ePDG tunnel"
 		kill -TERM "$DIAL_PID" 2>/dev/null || true
@@ -157,6 +165,8 @@ if [ "$SIM" = auto ]; then
 		have_mm && log "ModemManager also has a SIM; using PC/SC, pass --sim mm for the modem"
 	elif have_mm; then
 		SIM=mm
+	elif sim_up; then
+		SIM=server
 	else
 		die "no SIM found: no PC/SC reader (pcscd + pyscard) and no ModemManager modem with a SIM"
 	fi
@@ -165,6 +175,8 @@ log "SIM backend: $SIM"
 
 if sim_up; then
 	log "reusing the SIM server already on $SOCK"
+elif [ "$SIM" = server ]; then
+	die "no SIM server answering on $SOCK (start one, e.g. simcard-server/serial_server.py)"
 else
 	SERVERS=$(leftovers 'simcard-server/(server|mm_server)\.py')
 	[ -z "$SERVERS" ] || die "a SIM server is running (pid $SERVERS) but not \
@@ -192,6 +204,8 @@ if [ -z "$CONFIG" ]; then
 	log "generating $CONFIG with mkconfig"
 	if [ "$SIM" = mm ]; then
 		SIM_SEL=(--sim mm ${MODEM:+--modem "$MODEM"})
+	elif [ "$SIM" = server ]; then
+		SIM_SEL=(--sim server --simcard-server "unix:$SOCK")
 	else
 		SIM_SEL=(--sim pcsc ${READER:+--reader "$READER"})
 	fi
@@ -236,10 +250,84 @@ log "P-CSCF: $(head -n1 "$PCSCF_FILE")"
 
 # -- 5. NekoIMS ---------------------------------------------------------------
 
-log "starting NekoIMS in netns $NETNS"
-set +e
+# NekoIMS registers over the tunnel it started on. When the dialer redials
+# (new address, maybe a new P-CSCF; it replaces $PCSCF_FILE, and removes it
+# while down) NekoIMS is restarted once the new tunnel is up. With --watch a
+# rebuild of build/nekoims (as the normal user) restarts it too, and its
+# output and the dialer's are copied to build/ (readable without root).
+# Quitting NekoIMS from its console or Ctrl-C ends the script.
+tunnel_id() { stat -c '%i.%Y' "$PCSCF_FILE" 2>/dev/null || echo none; }
+mtime() { stat -c %Y "$BUILD/nekoims" 2>/dev/null || echo 0; }
+REASON_FILE=$RUN_DIR/restart.reason
 
-ip netns exec "$NETNS" "$BUILD/nekoims" -c "$CONFIG" "${NEKOIMS_ARGS[@]}" 9>&-
-RC=$?
-set -e
-exit "$RC"
+if [ "$WATCH" = 1 ]; then
+	NEKO_LOG=$BUILD/nekoims.log
+	[ -s "$NEKO_LOG" ] && mv -f "$NEKO_LOG" "$NEKO_LOG.1"  # the previous run's
+	: >"$NEKO_LOG"
+	: >"$BUILD/dialer.log"
+	if [ -n "${SUDO_USER:-}" ]; then
+		chown "$SUDO_USER" "$NEKO_LOG" "$BUILD/dialer.log"
+	fi
+	tail -n +1 -F "$DIAL_LOG" >>"$BUILD/dialer.log" 2>/dev/null 9>&- &
+	TAIL_PID=$!
+fi
+
+while :; do
+	for _ in $(seq $((DIAL_TIMEOUT * 5))); do
+		[ -s "$PCSCF_FILE" ] && break
+		kill -0 "$DIAL_PID" 2>/dev/null || die "dialer exited"
+		sleep 0.2
+	done
+	[ -s "$PCSCF_FILE" ] || die "no tunnel after ${DIAL_TIMEOUT}s"
+	STAMP=$(mtime) TUNNEL=$(tunnel_id)
+	rm -f "$REASON_FILE"
+
+	# Watcher: SIGINT (clean deregistration, if the network is still
+	# there) on a new build or a new tunnel.
+	(
+		while sleep 2; do
+			if [ "$WATCH" = 1 ] && [ "$(mtime)" != "$STAMP" ]; then
+				echo build >"$REASON_FILE"
+				sleep 2  # let the linker finish
+			elif [ "$(tunnel_id)" != "$TUNNEL" ]; then
+				echo tunnel >"$REASON_FILE"
+			else
+				continue
+			fi
+			pkill -INT -f "^$BUILD/nekoims -c " || true
+			break
+		done
+	) 9>&- &
+	WATCH_PID=$!
+
+	set +e
+	if [ "$WATCH" = 1 ]; then
+		log "starting NekoIMS in netns $NETNS (log: $NEKO_LOG)"
+		echo "=== start.sh: NekoIMS started $(date '+%F %T') ===" >>"$NEKO_LOG"
+		# script(1): NekoIMS keeps a terminal (line-buffered output,
+		# console input) while everything is flushed to the log.
+		CMD=$(printf '%q ' ip netns exec "$NETNS" "$BUILD/nekoims" \
+			-c "$CONFIG" "${NEKOIMS_ARGS[@]}")
+		script -q -f -e -a -c "$CMD" "$NEKO_LOG" 9>&-
+	else
+		log "starting NekoIMS in netns $NETNS"
+		ip netns exec "$NETNS" "$BUILD/nekoims" -c "$CONFIG" \
+			"${NEKOIMS_ARGS[@]}" 9>&-
+	fi
+	RC=$?
+	set -e
+	kill "$WATCH_PID" 2>/dev/null || true
+	wait "$WATCH_PID" 2>/dev/null || true
+
+	REASON=$(cat "$REASON_FILE" 2>/dev/null || true)
+	rm -f "$REASON_FILE"
+	case $REASON in
+		build)	MSG="build/nekoims changed" ;;
+		tunnel)	MSG="the ePDG tunnel changed" ;;
+		*)	exit "$RC" ;;
+	esac
+	log "$MSG, restarting NekoIMS"
+	[ "$WATCH" = 0 ] ||
+		echo "=== start.sh: restarting, $MSG ===" >>"$NEKO_LOG"
+	sleep 1
+done

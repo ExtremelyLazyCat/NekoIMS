@@ -11,8 +11,10 @@ Same API as server.py (USIM-https-server compatible, plain HTTP):
   GET /?type=imsi
       -> {"imsi": "311480..."}
 
-  GET /?type=rand-autn&rand=<32 hex>&autn=<32 hex>
+  GET /?type=rand-autn&rand=<32 hex>&autn=<32 hex>[&app=isim]
       -> {"res": "<hex>", "ck": "<hex>", "ik": "<hex>"}
+      app=isim (an extension, for IMS AKA) runs it on the ISIM, over a
+      logical channel of its own, or on the USIM if the card has no ISIM.
       On AKA synchronisation failure (AUTS in "res", as SWu-IKEv2 expects):
       -> {"res": "<auts>", "ck": null, "ik": null, "auts": "<28 hex>"}
 
@@ -65,6 +67,7 @@ MM_PORT_QMI = 6          # MMModemPortType
 MM_PORT_MBIM = 7
 
 USIM_AID_PREFIX = bytes.fromhex("A0000000871002")
+ISIM_AID_PREFIX = bytes.fromhex("A0000000871004")
 QMI_TIMEOUT = 10         # seconds per QMI request
 
 DEFAULT_UNIX_SOCKET = "/run/nekoims/simcard.sock"
@@ -72,6 +75,10 @@ DEFAULT_UNIX_SOCKET = "/run/nekoims/simcard.sock"
 
 class CardError(Exception):
     pass
+
+
+class NoApplication(CardError):
+    """The card status lists the card's applications and this isn't one."""
 
 
 def log(msg: str):
@@ -154,14 +161,16 @@ class Modem:
 # -- QMI UIM logical channel ------------------------------------------------
 
 class QmiUimChannel:
-    """One QMI UIM client and logical channel to the USIM, via qmi-proxy.
+    """One QMI UIM client and logical channel to the USIM (or the ISIM, for
+    IMS AKA), via qmi-proxy.
 
     libqmi is asynchronous and bound to a GLib main context, so a dedicated
     thread owns the context and every operation is run on it.
     """
 
-    def __init__(self, slot: int, aid: bytes | None):
+    def __init__(self, slot: int, aid: bytes | None, app: str = "usim"):
         self.slot = slot
+        self.app = app
         self.fixed_aid = aid
         self.aid = None
         self.dev_path = None
@@ -172,7 +181,7 @@ class QmiUimChannel:
         self.ctx = GLib.MainContext.new()
         self.loop = GLib.MainLoop.new(self.ctx, False)
         self.thread = threading.Thread(target=self._run, daemon=True,
-                                       name="qmi")
+                                       name=f"qmi-{app}")
         self.thread.start()
 
     def _run(self):
@@ -232,26 +241,35 @@ class QmiUimChannel:
                             dev.allocate_client_finish)
         self.device, self.client, self.dev_path = dev, client, dev_path
 
-    def _usim_aid(self) -> bytes:
+    def _app_aid(self) -> bytes:
         if self.fixed_aid:
             return self.fixed_aid
+        want = (Qmi.UimCardApplicationType.ISIM if self.app == "isim"
+                else Qmi.UimCardApplicationType.USIM)
+        prefix = ISIM_AID_PREFIX if self.app == "isim" else USIM_AID_PREFIX
         try:
             out = self._wait(lambda cb: self.client.get_card_status(
                                  None, QMI_TIMEOUT, None, cb, None),
                              self.client.get_card_status_finish)
             out.get_result()
             cards = out.get_card_status()[-1]
+            listed = False
             for card in cards:
                 for app in card.applications:
-                    if app.type == Qmi.UimCardApplicationType.USIM:
+                    listed = True
+                    if app.type == want:
                         return bytes(app.application_identifier_value)
         except Exception as e:  # GI struct access varies between versions
-            log(f"card status lookup failed ({e}); using partial USIM AID")
-        # ISO 7816-4 partial DF name selection: RID + USIM application code
-        return USIM_AID_PREFIX
+            log(f"card status lookup failed ({e}); using partial "
+                f"{self.app.upper()} AID")
+            listed = False
+        if listed:
+            raise NoApplication(f"no {self.app.upper()} on the card")
+        # ISO 7816-4 partial DF name selection: RID + application code
+        return prefix
 
     def _open_channel(self):
-        aid = self._usim_aid()
+        aid = self._app_aid()
         inp = Qmi.MessageUimOpenLogicalChannelInput.new()
         inp.set_slot(self.slot)
         inp.set_aid(list(aid))
@@ -265,8 +283,8 @@ class QmiUimChannel:
                             f"{e.message}")
         self.channel = out.get_channel_id()
         self.aid = aid
-        log(f"QMI UIM logical channel {self.channel} open on {self.dev_path}, "
-            f"AID {aid.hex().upper()}")
+        log(f"QMI UIM logical channel {self.channel} ({self.app.upper()}) "
+            f"open on {self.dev_path}, AID {aid.hex().upper()}")
 
     def _close(self):
         if self.client and self.channel is not None:
@@ -349,6 +367,8 @@ class QmiUimChannel:
         try:
             self._ensure(dev_path)
             return self._xmit(apdu)
+        except NoApplication:
+            raise
         except CardError as e:
             log(f"QMI error ({e}), reopening channel")
             self._close()
@@ -363,20 +383,26 @@ class QmiUimChannel:
 # -- USIM operations --------------------------------------------------------
 
 class Usim:
-    def __init__(self, modem: Modem, chan: QmiUimChannel):
+    def __init__(self, modem: Modem, chan: QmiUimChannel,
+                 isim_chan: QmiUimChannel | None = None):
         self.modem = modem
         self.chan = chan
+        self.isim_chan = isim_chan  # opened on the first IMS AKA
+        self.no_isim = False
         self.lock = threading.Lock()
 
-    def _xmit(self, apdu: bytes):
+    def _xmit(self, apdu: bytes, chan: QmiUimChannel | None = None):
+        chan = chan or self.chan
         if not self.modem.qmi_dev:
             self.modem.resolve()
         try:
-            return self.chan.call(self.chan.transmit, self.modem.qmi_dev, apdu)
+            return chan.call(chan.transmit, self.modem.qmi_dev, apdu)
+        except NoApplication:
+            raise
         except CardError:
             # The modem may have re-enumerated (new index / port) after a reset.
             self.modem.resolve()
-            return self.chan.call(self.chan.transmit, self.modem.qmi_dev, apdu)
+            return chan.call(chan.transmit, self.modem.qmi_dev, apdu)
 
     def imsi(self) -> str:
         with self.lock:
@@ -396,12 +422,24 @@ class Usim:
             raise CardError(f"implausible IMSI {digits!r}")
         return digits
 
-    def authenticate(self, rand: bytes, autn: bytes) -> dict:
-        """UMTS AKA (AUTHENTICATE, 3G context). Returns hex RES/CK/IK or AUTS."""
+    def authenticate(self, rand: bytes, autn: bytes,
+                     isim: bool = False) -> dict:
+        """UMTS AKA (AUTHENTICATE, 3G context), on the ISIM if asked and the
+        card has one. Returns hex RES/CK/IK or AUTS."""
         body = bytes([len(rand)]) + rand + bytes([len(autn)]) + autn
         apdu = bytes([0x00, 0x88, 0x00, 0x81, len(body)]) + body + b"\x00"
         with self.lock:
-            data, sw1, sw2 = self._xmit(apdu)
+            chan = None
+            if isim and self.isim_chan and not self.no_isim:
+                chan = self.isim_chan
+            try:
+                data, sw1, sw2 = self._xmit(apdu, chan)
+            except NoApplication as e:
+                # Only when the card status says so; other ISIM errors fail
+                # the AKA rather than silently using the wrong application.
+                log(f"{e}, IMS AKA runs on the USIM")
+                self.no_isim = True
+                data, sw1, sw2 = self._xmit(apdu)
 
         if sw1 == 0x98 and sw2 == 0x62:
             raise CardError("authentication error: MAC failure (AUTN rejected)")
@@ -466,7 +504,8 @@ class Handler(BaseHTTPRequestHandler):
             elif kind == "rand-autn":
                 rand = parse_hex(q, "rand", 16)
                 autn = parse_hex(q, "autn", 16)
-                self._reply(200, self.usim.authenticate(rand, autn))
+                isim = q.get("app", [""])[0] == "isim"
+                self._reply(200, self.usim.authenticate(rand, autn, isim))
             elif kind == "apdu":
                 self._reply(200, self.usim.apdu(parse_hex(q, "hex")))
             else:
@@ -569,8 +608,10 @@ def main():
     modem = Modem(args.modem)
     chan = QmiUimChannel(args.slot,
                          bytes.fromhex(args.aid) if args.aid else None)
-    usim = Usim(modem, chan)
+    isim_chan = QmiUimChannel(args.slot, None, "isim")
+    usim = Usim(modem, chan, isim_chan)
     atexit.register(lambda: chan.call(chan.shutdown))
+    atexit.register(lambda: isim_chan.call(isim_chan.shutdown))
     # Run atexit (and so release the channel) on SIGTERM too.
     signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))
 

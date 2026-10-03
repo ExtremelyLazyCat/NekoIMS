@@ -105,6 +105,7 @@ class Sms {
     void send_ack(const struct sip_msg* msg, sms::Format f,
                   const std::vector<uint8_t>& body);
     std::string ims_headers() const;
+    std::string outbound() const;
     bool seen(const std::string& id);
     void rewrite(const struct sip_msg* msg, const std::string& body,
                  const std::string& from);

@@ -297,7 +297,8 @@ bool Sms::send_raw(sms::Format f, const std::vector<uint8_t>& pdu,
 
     struct uri route;
     struct pl pl;
-    pl_set_str(&pl, cfg_.outbound.c_str());
+    const std::string ob = outbound();
+    pl_set_str(&pl, ob.c_str());
     if (uri_decode(&route, &pl)) return why = "bad P-CSCF URI", false;
 
     unsigned ref = 0;
@@ -337,14 +338,25 @@ void Sms::on_result(const sms::Message& m) {
                  "%u,%s,%u", m.ref, to.c_str(), m.cause);
 }
 
+// The P-CSCF, at its protected port once sec-agree's SAs are up.
+std::string Sms::outbound() const {
+    return reg_ && !reg_->outbound().empty() ? reg_->outbound()
+                                             : cfg_.outbound;
+}
+
 std::string Sms::ims_headers() const {
-    std::string hdrs = "Route: <" + cfg_.outbound + ";lr>\r\n";
+    std::string hdrs = "Route: <" + outbound() + ";lr>\r\n";
     if (reg_) {
         const std::vector<std::string>& sr = reg_->service_route();
         for (size_t i = 0; i < sr.size(); ++i)
             hdrs += "Route: " + sr[i] + "\r\n";
+        const std::string sv = reg_->security_verify();
+        if (!sv.empty())
+            hdrs += "Security-Verify: " + sv +
+                    "\r\nRequire: sec-agree\r\nProxy-Require: sec-agree\r\n";
     }
-    hdrs += "P-Preferred-Identity: <" + cfg_.impu + ">\r\n";
+    hdrs += "P-Preferred-Identity: <" +
+            (reg_ ? reg_->preferred_identity() : cfg_.impu) + ">\r\n";
     if (!cfg_.pani.empty())
         hdrs += "P-Access-Network-Info: " + cfg_.pani + "\r\n";
     hdrs += "Request-Disposition: no-fork\r\n";
@@ -377,9 +389,10 @@ void Sms::send_ack(const struct sip_msg* msg, sms::Format f,
 
     struct uri route;
     struct pl pl;
-    pl_set_str(&pl, cfg_.outbound.c_str());
+    const std::string ob = outbound();
+    pl_set_str(&pl, ob.c_str());
     if (uri_decode(&route, &pl)) {
-        warning("sms: bad P-CSCF URI %s\n", cfg_.outbound.c_str());
+        warning("sms: bad P-CSCF URI %s\n", ob.c_str());
         return;
     }
 

@@ -44,6 +44,13 @@ struct Settings {
     unsigned pcscf_port = 5060;
     std::string transport = "udp";
     std::string ifname;        // tunnel interface (optional)
+    bool sec_agree = false;  // IMS IPsec, see ImsRegConfig
+    // IMS leg codecs. baresip's AMR encoder ignores mode-set and sends
+    // AMR-WB mode 8 / AMR MR122, so a network that restricts AMR modes (AT&T
+    // in incoming offers) needs them left out, e.g. "PCMU": answers follow
+    // the offer's codec order, not this one.
+    std::string audio_codecs = "AMR-WB/16000,AMR/8000,PCMU,PCMA";
+    std::string aka_app = "isim";  // SIM application for IMS AKA
     std::string sip_listen;    // optional, overrides sip_port
     unsigned sip_port = 5060;  // local SIP port on every address
     std::string simcard_server = kDefaultSimcardServer;
@@ -166,6 +173,16 @@ bool load_settings(const std::string& path, Settings& out) {
         out.ctrl_tcp_listen = j.value("ctrl_tcp_listen", out.ctrl_tcp_listen);
         out.httpd = j.value("httpd", out.httpd);
         out.http_listen = j.value("http_listen", out.http_listen);
+        out.sec_agree = j.value("sec_agree", out.sec_agree);
+        out.aka_app = j.value("aka_app", out.aka_app);
+        out.audio_codecs = j.value("audio_codecs", out.audio_codecs);
+        if (out.aka_app != "isim" && out.aka_app != "usim") {
+            std::fprintf(stderr,
+                         "nekoims: %s: \"aka_app\" must be \"isim\" or "
+                         "\"usim\"\n",
+                         path.c_str());
+            return false;
+        }
 
         if (j.contains("sms") &&
             !sms_settings(j["sms"], out.sms, path))
@@ -324,7 +341,6 @@ std::string baresip_config(const Settings& s) {
         c << "module\thttpd.so\n"
           << "http_listen\t" << s.http_listen << "\n";
 
-    c << "amr_mode\t8\n";
 
     return c.str();
 }
@@ -337,7 +353,7 @@ std::string ua_aor(const std::string& impu, const Settings& s) {
       << ";regint=0"
       << ";outbound=\"" << pcscf_uri(s) << "\""
       << ";100rel=yes"
-      << ";audio_codecs=AMR-WB/16000,AMR/8000,PCMU,PCMA";
+      << ";audio_codecs=" << s.audio_codecs;
 
     return a.str();
 }
@@ -501,6 +517,7 @@ int main(int argc, char* argv[]) {
     std::unique_ptr<nekoims::B2bua> b2bua;
     std::unique_ptr<nekoims::Sms> sms;
     nekoims::ImsRegConfig rc;
+    std::string ua_id;  // identity for calls and SMS, see below
     struct ua* ua = NULL;
     const std::string conf = baresip_config(settings);
 
@@ -523,10 +540,23 @@ int main(int argc, char* argv[]) {
     if (rc.impu.empty())
         rc.impu = "sip:" + settings.msisdn + "@" + settings.domain;
 
-    rc.contact_user = uri_user(rc.impu);
+    // Calls, SMS and the Contact use the number: an ISIM's IMPU is often a
+    // barred, IMSI-based identity that can register but not call.
+    ua_id = settings.msisdn.empty()
+                ? rc.impu
+                : "sip:" + settings.msisdn + "@" + settings.domain;
+    rc.contact_user = uri_user(ua_id);
     rc.outbound = pcscf_uri(settings);
     rc.contact_params = contact_params(settings);
     rc.expires = settings.expires;
+    rc.user_agent = settings.user_agent;
+    rc.sec_agree = settings.sec_agree;
+    rc.aka_app = settings.aka_app;
+    rc.sec_port = uint16_t(settings.sip_port);
+    rc.sec_proto = settings.transport;
+    if (settings.sec_agree && !settings.sip_listen.empty())
+        warning("nekoims: sec_agree uses sip_port %u for its SAs; make sure "
+                "sip_listen listens there\n", settings.sip_port);
     if (!settings.pani.empty())
         rc.headers.push_back(std::make_pair(
             std::string("P-Access-Network-Info"), settings.pani));
@@ -570,7 +600,7 @@ int main(int argc, char* argv[]) {
         settings.sms.tx != nekoims::SmsConfig::Off) {
         nekoims::SmsConfig sc = settings.sms;
         sc.deliver = !settings.b2bua || settings.ctrl_tcp;  // menu/ctrl_tcp
-        sc.impu = rc.impu;
+        sc.impu = ua_id;
         sc.domain = settings.domain;
         sc.outbound = rc.outbound;
         sc.pani = settings.pani;
@@ -595,7 +625,7 @@ int main(int argc, char* argv[]) {
         goto out;
     }
 
-    err = ua_alloc(&ua, ua_aor(rc.impu, settings).c_str());
+    err = ua_alloc(&ua, ua_aor(ua_id, settings).c_str());
     if (err) {
         warning("nekoims: account setup failed: %m\n", err);
         goto out;
@@ -606,7 +636,7 @@ int main(int argc, char* argv[]) {
     {
         std::vector<std::pair<std::string, std::string> > hdrs;
         hdrs.push_back(std::make_pair(std::string("P-Preferred-Identity"),
-                                      "<" + rc.impu + ">"));
+                                      "<" + ua_id + ">"));
         hdrs.push_back(std::make_pair(
             std::string("P-Preferred-Service"),
             std::string("urn:urn-7:3gpp-service.ims.icsi.mmtel")));
@@ -623,6 +653,13 @@ int main(int argc, char* argv[]) {
             pl_set_str(&val, hdrs[i].second.c_str());
             ua_add_custom_hdr(ua, &name, &val);
         }
+
+        // and P-Access-Network-Info on responses to INVITE (TS 24.229
+        // 5.1.4.2): AT&T cancels calls whose 180 has none ("Invalid
+        // Location"). Needs ua_set_resp_headers() from patches/baresip.
+        if (!settings.pani.empty())
+            ua_set_resp_headers(
+                ua, ("P-Access-Network-Info: " + settings.pani + "\r\n").c_str());
 
         // Handsets repeat these on BYE (TS 24.229 5.1.5)
         g_bye_hdrs = "Reason: SIP;cause=200;text=\"User Triggered\"\r\n";
@@ -653,6 +690,50 @@ int main(int argc, char* argv[]) {
             sms->set_lan(lan);
         }
     }
+
+    // With sec-agree, calls follow REGISTER to the P-CSCF's protected port
+    // and carry Security-Verify (TS 24.229 5.1.2A.1.1).
+    if (rc.sec_agree) {
+        rc.on_route_change = [ua]() {
+            if (!g_reg) return;
+            account_set_outbound(ua_account(ua), g_reg->outbound().c_str(), 0);
+            const char* names[] = {"Security-Verify", "Require",
+                                   "Proxy-Require"};
+            for (size_t i = 0; i < 3; ++i) {
+                struct pl name;
+                pl_set_str(&name, names[i]);
+                ua_rm_custom_hdr(ua, &name);
+            }
+            const std::string sv = g_reg->security_verify();
+            if (sv.empty()) return;
+            const std::string vals[] = {sv, "sec-agree", "sec-agree"};
+            for (size_t i = 0; i < 3; ++i) {
+                struct pl name, val;
+                pl_set_str(&name, names[i]);
+                pl_set_str(&val, vals[i].c_str());
+                ua_add_custom_hdr(ua, &name, &val);
+            }
+        };
+    }
+
+    // Assert the identity the registration says we have, not the (often
+    // barred) ISIM IMPU we registered (TS 24.229 5.1.2A.1.1).
+    rc.on_identity_change = [ua]() {
+        if (!g_reg) return;
+        const std::string ppi = "<" + g_reg->preferred_identity() + ">";
+        struct pl name, val;
+        pl_set_str(&name, "P-Preferred-Identity");
+        ua_rm_custom_hdr(ua, &name);
+        pl_set_str(&val, ppi.c_str());
+        ua_add_custom_hdr(ua, &name, &val);
+
+        const std::string key = "P-Preferred-Identity: ";
+        const size_t a = g_bye_hdrs.find(key);
+        if (a != std::string::npos) {
+            const size_t e = g_bye_hdrs.find("\r\n", a);
+            g_bye_hdrs.replace(a + key.size(), e - a - key.size(), ppi);
+        }
+    };
 
     reg.reset(new nekoims::ImsRegistration(uag_sip(), rc, sim));
     g_reg = reg.get();

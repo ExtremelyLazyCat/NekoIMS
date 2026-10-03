@@ -2,6 +2,8 @@
   "name": "Verizon Wireless",
   "mccmnc": "311480",
   "domain": "vzims.com",
+  "identity": "usim",
+  "aka_app": "usim",
   "epdg": "wo.vzwwo.com",
   "apn": "ims",
   "epdg_auth": "eap",
@@ -21,6 +23,7 @@
   "notes": [
     "Private home domain vzims.com and ePDG wo.vzwwo.com, not the 3GPP discovery names. The P-CSCF comes from the ePDG tunnel (SWu-IKEv2 prints it).",
     "The ePDG authenticates with EAP only (RFC 5998), no certificate, and answers IDr ims as topon.<node>.epc.mnc480.mcc311.3gppnetwork.org. It assigns an IPv6 address and three IPv6 P-CSCFs over the tunnel.",
+    "Identities are built from the IMSI and MSISDN (IMPI <IMSI>@vzims.com, IMPU sip:+1...@vzims.com) and IMS AKA runs on the USIM (identity/aka_app \"usim\"): that is what has been tested. The iOS bundle says USIMFallbackSupport false, so the ISIM may work too, but that is untested.",
     "REGISTER uses IMS-AKA with algorithm=AKAv2-MD5, no sec-agree/IPsec on Gm. The network grants 7200 s whatever Expires asks for.",
     "+sip.instance must carry the IMEI of the device the SIM is actually in (here the modem); reusing another handset's IMEI breaks calls.",
     "Outgoing calls: the reliable 183 carries the SDP answer, then a 180 and 200 OK without SDP (handled by the early media workaround in main.cpp).",
