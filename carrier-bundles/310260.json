@@ -19,7 +19,7 @@
   "expires": 600000,
   "sms": {
     "format": "3gpp",
-    "smsc": "tel:910090009000;phone-context=vzims.com"
+    "smsc": "+12063130004"
   },
   "notes": []
 }
