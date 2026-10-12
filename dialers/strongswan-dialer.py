@@ -87,6 +87,9 @@ if WINDOWS:
 else:
     RUN_DIR = "/run/nekoims"
     SIMCARD_DEFAULT = "unix:/run/nekoims/simcard.sock"
+# Where --remote unpacks builds. Not RUN_DIR: Ubuntu's initramfs mounts /run
+# noexec, so charon couldn't be started from there.
+REMOTE_CACHE = RUN_DIR if WINDOWS else "/var/cache/nekoims/strongswan"
 
 CHARON_CANDIDATES = () if WINDOWS else (
     "/usr/local/libexec/ipsec/charon",  # fork, default prefix
@@ -563,8 +566,14 @@ class Charon:
         if os.path.exists(self.vici_socket):
             os.unlink(self.vici_socket)
         env = dict(os.environ, STRONGSWAN_CONF=self.conf)
-        self.proc = subprocess.Popen([self.binary], env=env, stdout=self.log,
-                                     stderr=self.log)
+        try:
+            self.proc = subprocess.Popen([self.binary], env=env,
+                                         stdout=self.log, stderr=self.log)
+        except OSError as e:
+            hint = (" (its filesystem is mounted noexec)"
+                    if noexec(os.path.dirname(self.binary)) else "")
+            sys.exit(f"cannot start charon {self.binary}: "
+                     f"{e.strerror or e}{hint}")
         deadline = time.monotonic() + 10
         while not os.path.exists(self.vici_socket):
             if self.proc.poll() is not None:
@@ -713,12 +722,21 @@ def extract(archive: str, dest: str):
         tar.extractall(dest)
 
 
+def noexec(path: str) -> bool:
+    try:
+        return bool(os.statvfs(path).f_flag & getattr(os, "ST_NOEXEC", 0))
+    except OSError:
+        return False
+
+
 def use_remote(url: str, pinned: str | None) -> str:
-    """Download and unpack a static strongSwan build (see the neko-strongswan
-    release workflow) into a private directory that is removed on exit.
-    Returns the charon path; its vici Python client is put on sys.path."""
+    """Download a static strongSwan build (see the neko-strongswan release
+    workflow) and unpack it under REMOTE_CACHE/<sha256>, reusing that
+    directory when the download hasn't changed. Returns the charon path;
+    its vici Python client is put on sys.path."""
     url = url.replace("{arch}", remote_arch())
-    work = tempfile.mkdtemp(prefix="strongswan-", dir=RUN_DIR)
+    os.makedirs(REMOTE_CACHE, mode=0o755, exist_ok=True)
+    work = tempfile.mkdtemp(prefix="download-", dir=REMOTE_CACHE)
     atexit.register(shutil.rmtree, work, ignore_errors=True)
 
     archive = os.path.join(work, "strongswan.zip" if WINDOWS
@@ -738,12 +756,25 @@ def use_remote(url: str, pinned: str | None) -> str:
         log(f"warning: no sha256 to verify {url} against (got {digest}), "
             f"pin it with --remote-sha256")
 
-    root = os.path.join(work, "root")
-    try:
-        extract(archive, root)
-    except (tarfile.TarError, OSError) as e:
-        sys.exit(f"--remote: bad archive: {e}")
+    root = os.path.join(REMOTE_CACHE, digest)
+    if os.path.isdir(root):
+        log(f"using the unpacked build in {root}")
+    else:
+        tmp = os.path.join(work, "root")
+        try:
+            extract(archive, tmp)
+        except (tarfile.TarError, OSError) as e:
+            sys.exit(f"--remote: bad archive: {e}")
+        os.replace(tmp, root)
+        # drop builds from earlier downloads
+        for old in os.listdir(REMOTE_CACHE):
+            path = os.path.join(REMOTE_CACHE, old)
+            if old != digest and re.fullmatch(r"[0-9a-f]{64}", old):
+                shutil.rmtree(path, ignore_errors=True)
     os.unlink(archive)
+    if noexec(root):
+        sys.exit(f"--remote: {REMOTE_CACHE} is on a noexec mount, charon "
+                 f"can't run from it")
     binary = "bin/charon-svc.exe" if WINDOWS else "libexec/ipsec/charon"
     found = glob.glob(os.path.join(root, binary)) + \
         glob.glob(os.path.join(root, "*", binary))
