@@ -108,6 +108,7 @@ class ImsRegistration {
     void finish_stop();
     uint32_t granted_expires(const struct sip_msg* msg) const;
     std::string empty_authorization() const;
+    std::string build_authorization(std::string auts = "");
 
     struct sip* sip_;
     ImsRegConfig cfg_;
@@ -128,6 +129,10 @@ class ImsRegistration {
     unsigned retry_count_ = 0;
     bool sent_credentials_ = false;
     bool registered_ = false;
+    uint32_t curr_nc_ = 0;
+    char curr_cnonce_[17] = {};
+    uint8_t curr_resp_[MD5_SIZE] = {};
+    struct Challenge curr_ch_{};
     bool stopping_ = false;
     DoneHandler done_ = nullptr;
     void* done_arg_ = nullptr;

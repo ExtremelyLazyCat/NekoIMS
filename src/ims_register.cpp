@@ -18,6 +18,16 @@ std::string pl_str(const struct pl& pl) {
     return pl_isset(&pl) ? std::string(pl.p, pl.l) : std::string();
 }
 
+std::string hex_be(const void* p, size_t n) {
+    static const char digits[] = "0123456789abcdef";
+    std::string s;
+    for (size_t i = n; i > 0; i--) {
+        s += digits[static_cast<const uint8_t*>(p)[i-1] >> 4];
+        s += digits[static_cast<const uint8_t*>(p)[i-1] & 0xf];
+    }
+    return s;
+}
+
 std::string hex(const uint8_t* p, size_t n) {
     static const char digits[] = "0123456789abcdef";
     std::string s;
@@ -208,6 +218,33 @@ std::string ImsRegistration::empty_authorization() const {
            "\",nonce=\"\",response=\"\"\r\n";
 }
 
+std::string ImsRegistration::build_authorization(std::string auts) {
+    const std::string uri = "sip:" + cfg_.domain;
+
+    std::string auth = "Authorization: Digest username=\"" + cfg_.impi +
+                       "\",realm=\"" + curr_ch_.realm +
+                       "\",nonce=\"" + curr_ch_.nonce +
+                       "\",uri=\"" + uri +
+                       "\",response=\"" + hex(curr_resp_, sizeof(curr_resp_)) +
+                       "\",algorithm=" + curr_ch_.algorithm;
+
+    // Either include nc for qop_auth, include if nc > 0, or increment to one
+    // for future re-registrations using cached Authorization.
+    if (curr_ch_.qop_auth) {
+        auth += ",qop=auth,nc=" + hex_be(&++curr_nc_, sizeof(curr_nc_)) +
+                ",cnonce=\"" + curr_cnonce_ + "\"";
+    }
+    else if (curr_nc_ > 0)
+        { auth += ",nc=" + hex_be(&curr_nc_, sizeof(curr_nc_)); ++curr_nc_; }
+    else
+        ++curr_nc_;
+    if (!curr_ch_.opaque.empty()) auth += ",opaque=\"" + curr_ch_.opaque + "\"";
+    if (!auts.empty()) auth += ",auts=\"" + auts + "\"";
+    auth += "\r\n";
+
+    return auth;
+}
+
 int ImsRegistration::send_register(const std::string& authorization) {
     std::string hdrs = authorization;
     for (size_t i = 0; i < cfg_.headers.size(); ++i)
@@ -351,7 +388,8 @@ void ImsRegistration::on_ok(const struct sip_msg* msg) {
     for (size_t i = 0; i < service_route_.size(); ++i)
         info("ims: Service-Route: %s\n", service_route_[i].c_str());
 
-    uint32_t refresh = granted / 2;
+    // 50min refresh interval for standard 1hr grant time
+    uint32_t refresh = (granted * 5) / 6;
     if (refresh < kMinRefresh) refresh = kMinRefresh;
     tmr_start(&tmr_, refresh * 1000ULL, timer_handler, this);
 }
@@ -533,16 +571,10 @@ void ImsRegistration::on_aka(AkaJob* job) {
         return;
     }
 
-    std::string auth = "Authorization: Digest username=\"" + cfg_.impi +
-                       "\",realm=\"" + ch.realm + "\",nonce=\"" + ch.nonce +
-                       "\",uri=\"" + uri + "\",response=\"" +
-                       hex(resp, sizeof(resp)) + "\",algorithm=" + ch.algorithm;
-    if (ch.qop_auth)
-        auth += ",qop=auth,nc=" + nc + ",cnonce=\"" + cnonce + "\"";
-    if (!ch.opaque.empty()) auth += ",opaque=\"" + ch.opaque + "\"";
-    if (!auts.empty()) auth += ",auts=\"" + auts + "\"";
-    auth += "\r\n";
-
+    std::memcpy(curr_cnonce_, cnonce, sizeof(cnonce));
+    std::memcpy(curr_resp_, resp, sizeof(resp));
+    curr_ch_ = ch;
+    std::string auth = build_authorization(auts);
     // A resync isn't a credential failure; the next 401 carries a new vector.
     sent_credentials_ = !r.sync_failure;
 
@@ -567,7 +599,7 @@ void ImsRegistration::on_aka(AkaJob* job) {
         }
         struct sa ps = server_addr_;
         sa_set_port(&ps, server_.port_s);
-        
+
         struct sip_conncfg cc;
         memset(&cc, 0, sizeof(cc));
         cc.srcport = cfg_.sec_port;
@@ -591,6 +623,8 @@ void ImsRegistration::fail(const char* why) {
     registered_ = false;
     sent_credentials_ = false;
     auth_failures_ = 0;
+    curr_nc_ = 0;
+    curr_ch_ = {};
     drop_ipsec();
     new_dialog();
 
@@ -609,12 +643,14 @@ void ImsRegistration::fail(const char* why) {
 
 void ImsRegistration::timer_handler(void* arg) {
     ImsRegistration* self = static_cast<ImsRegistration*>(arg);
+    int err;
     self->expires_ = self->cfg_.expires;
-    // A re-REGISTER goes over the current SAs with fresh SPIs for the next
-    // set (TS 33.203 7.4); after a failure it starts from scratch.
-    if (self->cfg_.sec_agree) self->new_spis();
 
-    int err = self->send_register(self->empty_authorization());
+    // re-REGISTER with cached auth info for ipsec-3gpp
+    if (self->cfg_.sec_agree)
+        err = self->send_register(self->build_authorization());
+    else
+        err = self->send_register(self->empty_authorization());
     if (err) {
         warning("ims: REGISTER send failed: %m\n", err);
         self->fail("send");
